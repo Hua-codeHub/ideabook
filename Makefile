@@ -1,7 +1,7 @@
 include_dir=build
 source=chapters/*.md
-title='IdeaBook'
-filename='ebook'
+title="Phodal's Idea实战指南"
+filename='ideabook'
 
 
 all: html epub rtf pdf mobi

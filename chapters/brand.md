@@ -1,10 +1,18 @@
+制作专属Badge制作
+===
+
+概况
+---
+
+### 背景
+
 前几天，再次看到一些CI的Badge的时候，就想着要做一个自己的Badge:
 
-![Badge][1]
+![Badge](./images/badge.png)
 
 接着，我就找了个图形工具简单地先设计了下面的一个Badge:
 
-![Demo][2]
+![Demo](./images/demo.png)
 
 生成的格式是SVG，接着我就打开SVG看看里面发现了什么。
 
@@ -30,8 +38,13 @@
 
 看了看代码很简单，我就想这可以用代码生成——我就可以生成出不同的样子了。
 
-SVG与SVGWrite
----
+### ShowCase
+
+![Finally](./images/finally-brand.jpg)
+
+代码： GitHub: [https://github.com/phodal/brand](https://github.com/phodal/brand)
+
+###SVG与SVGWrite
 
 SVG就是一个XML
 
@@ -40,6 +53,11 @@ SVG就是一个XML
 要对这个XML进行修改也是一件很容易的事。只是，先找了PIL发现不支持，就找到了一个名为SVGWrite的工具。
 
 > A Python library to create SVG drawings.
+
+步骤
+---
+
+### Step 1: 基本图形
 
 示例代码如下:
 
@@ -70,12 +88,11 @@ dwg.save()
 
 发现和上面的样式几乎是一样的，就顺手做了剩下的几个。然后想了想，我这样做都一样，一点都不好看。
 
-高级Badge
----
+### Step 2: 高级Badge
 
 第一眼看到
 
-![Idea Prototype][4]
+![Idea Prototype](./images/brand-idea-prototype.jpg)
 
 我就想着要不和这个一样好了，不就是画几条线的事么。
 
@@ -101,16 +118,7 @@ dwg.save()
 
 就有了下面的图，于是我又按照这种感觉来了好几下
 
-![Finally][3]
-
-最后代码
----
-
-GitHub: [https://github.com/phodal/brand](https://github.com/phodal/brand)
+![Finally](./images/finally-brand.jpg)
 
 
-  [1]: /static/media/uploads/badge.png
-  [2]: /static/media/uploads/demo.png
-  [3]: /static/media/uploads/finally-brand.jpg
-  [4]: /static/media/uploads/brand-idea-prototype.jpg
 

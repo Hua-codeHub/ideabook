@@ -1,11 +1,512 @@
 
+分析网站日志，打造访问地图
+===
+
+概况
+---
+
+### 背景
+
+这个项目的背景是起源于，我有一个2G左右的网站访问日志。我想看看访问网站的人都来自哪里，于是我想开始想办法来分析这日志。当时正值大数据火热的时候，便想拿着Hadoop来做这样一件事。
+
+### ShowCase
+
+最后的效果如下图如示：
+
+![Demo](./images/map_with_bg.jpg)
+
+这是一个Web生成的界面，通过Elastic.js向搜索引擎查询数据，将再这些数据渲染到地图上。
+
+###Hadoop + Pig + Jython + AmMap + ElasticSearch
+
+我们使用的技术栈有上面这些，他们的简介如下：
+
+ - Hadoop是一个由Apache基金会所开发的分布式系统基础架构。用户可以在不了解分布式底层细节的情况下，开发分布式程序。充分利用集群的威力进行高速运算和存储。
+ - Pig 是一个基于Hadoop的大规模数据分析平台，它提供的SQL-LIKE语言叫Pig Latin，该语言的编译器会把类SQL的数据分析请求转换为一系列经过优化处理的MapReduce运算。
+ - Jython是一种完整的语言，而不是一个Java翻译器或仅仅是一个Python编译器，它是一个Python语言在Java中的完全实现。Jython也有很多从CPython中继承的模块库。
+ - AmMap是用于创建交互式Flash地图的工具。您可以使用此工具来显示您的办公室地点，您的行程路线，创建您的经销商地图等。
+ - ElasticSearch是一个基于Lucene 构建的开源，分布式，RESTful 搜索引擎。 设计用于云计算中，能够达到搜索实时、稳定、可靠和快速，并且安装使用方便。
+
+步骤
+---
+
+总的步骤并不是很复杂，可以分为：
+
+ - 搭建基础设施
+ - 解析access.log
+ - 转换IP为GEO信息
+ - 展示数据到地图上
+
+###Step 1: 搭建基础设施
+
+在这一些系列的实战中，比较麻烦的就是安装这些工具，我们需要安装上面提到的一系列工具。对于不同的系统来说，都有相似的安装工具：
+
+ - Windows上可以使用Chocolatey
+ - Ubuntu / Mint上可以使用aptitude
+ - CentOS / OpenSUSE上可以使用yum安装
+ - Mac OS上可以使用brew安装
+
+如下是Mac OS下安装Hadoop、Pig、Elasticsearch、Jython的方式
+
+```bash
+brew install hadoop
+brew install pig 
+brew install elasticsearch
+brew install jython
+```
+
+对于其他操作系统也可以使用相似的方法来安装。接着我们还需要安装一个Hadoop的插件，用于连接Hadoop和ElasticSearch。
+
+下载地址：[https://github.com/elastic/elasticsearch-hadoop](https://github.com/elastic/elasticsearch-hadoop)
+
+复制其中的``elasticsearch-hadoop-*.jar``、``elasticsearch-hadoop-pig-*.jar``到你的pig库的目录，如我的是：``/usr/local/Cellar/pig/0.14.0``。
+
+由于我使用提早期的版本，所以这里我的文件名是：``elasticsearch-hadoop-2.1.0.Beta3.jar``、``elasticsearch-hadoop-pig-2.1.0.Beta3.jar``。
+
+下面我们就可以尝试去解析我们的日志了。
+
+###Step 2: 解析access.log
+
+在开始解析之前，先让我们来看看几条Nginx的日志：
+
+```
+106.39.113.203 - - [28/Apr/2016:10:40:31 +0000] "GET / HTTP/2.0" 200 0 "https://www.phodal.com/" "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/49.0.2623.87 Safari/537.36" -
+66.249.65.119 - - [28/Apr/2016:10:40:51 +0000] "GET /set_device/default/?next=/blog/use-falcon-peewee-build-high-performance-restful-services-wordpress/ HTTP/1.1" 302 5 "-" "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)" -
+```
+
+而上面的日志实际上是有对应的格式的，这个格式写在我们的Nginx配置文件中。如下是上面的日志的格式：
+
+```
+log_format  access $remote_addr - $remote_user [$time_local] "$request" '
+		'$status $body_bytes_sent "$http_referer" '
+		'"$http_user_agent" $http_x_forwarded_for';
+```		
+
+在最前面的是访问者的IP地址，然后是访问者的当地时间、请求的类型、状态码、访问的URL、用户的User Agent等等。随后，我们就可以针对上面的格式编写相应的程序，这些代码如下所示：
+
+```
+register file:/usr/local/Cellar/pig/0.14.0/libexec/lib/piggybank.jar;
+register file:/usr/local/Cellar/pig/0.14.0/libexec/lib/elasticsearch-hadoop-pig-2.1.0.Beta3.jar;
+
+RAW_LOGS = LOAD 'data/access.log' USING TextLoader as (line:chararray);
+
+LOGS_BASE = FOREACH RAW_LOGS GENERATE
+    FLATTEN(
+      REGEX_EXTRACT_ALL(line, '(\\S+) - - \\[([^\\[]+)\\]\\s+"([^"]+)"\\s+(\\d+)\\s+(\\d+)\\s+"([^"]+)"\\s+"([^"]+)"\\s+-')
+    )
+    AS (
+        ip: chararray,
+        timestamp: chararray,
+        url: chararray,
+        status: chararray,
+        bytes: chararray,
+        referrer: chararray,
+        useragent: chararray
+    );
+
+A = FOREACH LOGS_BASE GENERATE ToDate(timestamp, 'dd/MMM/yyyy:HH:mm:ss Z') as date, ip, url,(int)status,(int)bytes,referrer,useragent;
+--B = GROUP A BY (timestamp);
+--C = FOREACH B GENERATE FLATTEN(group) as (timestamp), COUNT(A) as count;
+--D = ORDER C BY timestamp,count desc;
+STORE A INTO 'nginx/log' USING org.elasticsearch.hadoop.pig.EsStorage();
+```
+
+在第1~2行里，我们使用了自定义的jar文件。接着在第4行，载入了log文件，并其值赋予RAW_LOGS。随后的第6行里，我们取出RAW_LOGS中的每一个值 ，根据下面的正则表达式，取出其对应的值到对象里，如``- -``前面的(\\S+)对应的是ip，最后将这些值赋给LOGS_BASE。
+
+接着，我们就可以对值进行一些特殊的处理，如A是转化时间戳后的结果。B是按时间戳排序后的结果。最后，我们再将这些值存储到ElasticSearch对应的索引``nginx/log``中。
+
+###Step 3: 转换IP为GEO信息
+
+在简单地完成了一个Demo之后，我们就可以将IP转换为GEO信息了，这里我们需要用到一个名为pygeoip的库。GeoIP是一个根据IP地址查询位置的API的集成。它支持对国家、地区、城市、纬度和经度的查询。实际上，就是在一个数据库中有对应的国家和地区的IP段，根据这个IP段，我们就可以获取对应的地理位置。
+
+由于使用Java来实现这个功能比较麻烦，这里我们就使用Jython来实现。大部分的过程和上面都是一样的，除了注册了一个自定义的库，并在这个库里使用了解析GEO的方法，代码如下所示：
+
+```
+register file:/usr/local/Cellar/pig/0.14.0/libexec/lib/piggybank.jar;
+register file:/usr/local/Cellar/pig/0.14.0/libexec/lib/elasticsearch-hadoop-pig-2.1.0.Beta3.jar;
+register utils.py using jython as utils;
+
+RAW_LOGS = LOAD 'data/access.log' USING TextLoader as (line:chararray);
+
+LOGS_BASE = FOREACH RAW_LOGS GENERATE
+    FLATTEN(
+      REGEX_EXTRACT_ALL(line, '(\\S+) - - \\[([^\\[]+)\\]\\s+"([^"]+)"\\s+(\\d+)\\s+(\\d+)\\s+"([^"]+)"\\s+"([^"]+)"\\s+-')
+    )
+    AS (
+        ip: chararray,
+        timestamp: chararray,
+        url: chararray,
+        status: chararray,
+        bytes: chararray,
+        referrer: chararray,
+        useragent: chararray
+    );
+
+A = FOREACH LOGS_BASE GENERATE ToDate(timestamp, 'dd/MMM/yyyy:HH:mm:ss Z') as date, utils.get_country(ip) as country,
+    utils.get_city(ip) as city, utils.get_geo(ip) as location,ip,
+    url, (int)status,(int)bytes,referrer,useragent;
+
+STORE A INTO 'nginx/log' USING org.elasticsearch.hadoop.pig.EsStorage();
+```
+
+在第三行里，我们注册了``utils.py``并将其中的函数作为utils。接着在倒数第二行里，我们执行了四个utils函数。即:
+
+ - get_country从IP中解析出国家
+ - get_city从IP中解析出城市
+ - get_geo从IP中解析出经纬度信息
+
+其对应的Python代码如下所示: 
+
+```
+#!/usr/bin/python
+
+import sys
+sys.path.append('/Users/fdhuang/test/lib/python2.7/site-packages/')
+import pygeoip
+gi = pygeoip.GeoIP("data/GeoLiteCity.dat")
+
+@outputSchema('city:chararray')
+def get_city(ip):
+    try:
+        city = gi.record_by_name(ip)["city"]
+        return city
+    except:
+        pass
+
+
+@outputSchema('country:chararray')
+def get_country(ip):
+    try:
+        city = gi.record_by_name(ip)["country_name"]
+        return city
+    except:
+        pass
+
+@outputSchema('location:chararray')
+def get_geo(ip):
+    try:
+        geo = str(gi.record_by_name(ip)["longitude"]) + "," + str(gi.record_by_name(ip)["latitude"])
+        return geo
+    except:
+        pass
+```        
+
+代码相应的简单，和一般的Python代码也没有啥区别。这里一些用户自定义函数，在函数的最前面有一个``outputSchema``，用于返回输出的结果。
+
+###Step 4: 展示数据到地图上
+
+现在，我们终于可以将数据转化到可视化界面了。开始之前，我们需要几个库
+
+ - jquery 地球人都知道
+ - elasticsearch.jquery即用于搜索功能
+ - ammap用于制作交互地图。
+
+添加这些库到html文件里:
+
+```html
+<script src="bower_components/jquery/dist/jquery.js"></script>
+<script src="bower_components/elasticsearch/elasticsearch.jquery.js"></script>
+
+<script src="bower_components/ammap/dist/ammap/ammap.js" type="text/javascript"></script>
+<script src="bower_components/ammap/dist/ammap/maps/js/worldLow.js" type="text/javascript"></script>
+<script src="bower_components/ammap/dist/ammap/themes/black.js" type="text/javascript"></script>
+<script src="scripts/latlng.js"></script>
+<script src="scripts/main_ammap.js"></script>
+```
+
+生成过程大致如下所示：
+
+ - 获取不同国家的全名，用于解析出全名，如US -> "United States"
+ - 查找ElasticSearch搜索引擎中的数据，并计算访问量
+ - 再将数据渲染到地图上
+
+对应的main文件如下所示：
+
+```javascript
+var client = new $.es.Client({
+	hosts: 'localhost:9200'
+});
+
+// 创建ElasticSearch搜索条件
+
+var query = {
+	index: 'nginx',
+	type: 'log',
+	size: 200,
+	body: {
+		query: {
+			query_string: {
+				query: "*"
+			}
+		},
+		aggs: {
+			2: {
+				terms: {
+					field: "country",
+					size: 200,
+					order: {
+						_count: "desc"
+					}
+				}
+			}
+		}
+	}
+};
+
+// 获取到country.json后生成数据
+
+$(document).ready(function () {
+	$.ajax({
+		type: "GET",
+		url: "country.json",
+		success: function (data) {
+			generate_info(data)
+		}
+	});
+});
+
+// 根据数据中的国家名，来计算不同国家的访问量大小。
+
+var generate_info = function(data){
+	var mapDatas = [];
+	client.search(query).then(function (results) {
+		$.each(results.aggregations[2].buckets, function(index, bucket){
+			var mapData;
+			$.each(data, function(index, country){
+				if(country.name.toLowerCase() === bucket.key) {
+					mapData = {
+						code: country.code,
+						name: country.name,
+						value: bucket.doc_count,
+						color: "#eea638"
+					};
+				}
+			});
+			if(mapData !== undefined){
+				mapDatas.push(mapData);
+			}
+		});
+		create_map(mapDatas);
+	});
+};
+
+var create_map = function(mapData){
+	var map;
+	var minBulletSize = 3;
+	var maxBulletSize = 70;
+	var min = Infinity;
+	var max = -Infinity;
+
+	AmCharts.theme = AmCharts.themes.black;
+
+	for (var i = 0; i < mapData.length; i++) {
+		var value = mapData[i].value;
+		if (value < min) {
+			min = value;
+		}
+		if (value > max) {
+			max = value;
+		}
+	}
+
+	map = new AmCharts.AmMap();
+	map.pathToImages = "bower_components/ammap/dist/ammap/images/";
+
+	map.areasSettings = {
+		unlistedAreasColor: "#FFFFFF",
+		unlistedAreasAlpha: 0.1
+	};
+
+	map.imagesSettings = {
+		balloonText: "<span style='font-size:14px;'><b>[[title]]</b>: [[value]]</span>",
+		alpha: 0.6
+	};
+
+	var dataProvider = {
+		mapVar: AmCharts.maps.worldLow,
+		images: []
+	};
+
+	var maxSquare = maxBulletSize * maxBulletSize * 2 * Math.PI;
+	var minSquare = minBulletSize * minBulletSize * 2 * Math.PI;
+
+	for (var i = 0; i < mapData.length; i++) {
+		var dataItem = mapData[i];
+		var value = dataItem.value;
+		// calculate size of a bubble
+		var square = (value - min) / (max - min) * (maxSquare - minSquare) + minSquare;
+		if (square < minSquare) {
+			square = minSquare;
+		}
+		var size = Math.sqrt(square / (Math.PI * 2));
+		var id = dataItem.code;
+
+		dataProvider.images.push({
+			type: "circle",
+			width: size,
+			height: size,
+			color: dataItem.color,
+			longitude: latlong[id].longitude,
+			latitude: latlong[id].latitude,
+			title: dataItem.name,
+			value: value
+		});
+	}
+
+	map.dataProvider = dataProvider;
+
+	map.write("mapdiv");
+};
+```
+
+我们可以看到比较麻烦的地方就是生成地图上的数量点，也就是create_map函数。
+
+###练习建议
+
+书籍录入程序
+======
+
+概况
+---
+
+### 背景
+
+这个项目的起源是我想录入我的书架上的书籍——当时，大概有近四百本左右。由于大部分的手机软件都是收费的，或封闭的，因此我便想着自己写一个app来完成书籍的录入。
+
+### ShowCase
+
+最后的效果如下图所示：
+
+![Bookshelf](./images/bookshelf.jpg)
+
+代码见： [https://github.com/phodal/bookshelf/](https://github.com/phodal/bookshelf/)
+
+### Ionic + Zxing
+
+所需要的移动框架还是Ionic，用于扫描条形码的库是ZXing。
+
+步骤
+---
+
+开始之前，我们需要先安装Ionic，并且使用它来创建一个APP。然后我们还需要添加对应的二维码扫描库，代码如下所示：
+
+    phonegap plugin add phonegap-plugin-barcodescanner
+
+接着我们就可以开始制作我们的APP了。
+
+###Step 1: ZXing扫描与Douban API
+
+我们需要在我们的模板里，添加一个ICON或者按钮来触发程序调用相应的函数：
+
+```html
+<i class="icon icon-right ion-qr-scanner" ng-click="scan()"></i>
+```
+
+在我们的函数里，我们只需要调用cordovaBarcodeScanner的scan方法就可以获取到二维码的值。再用$http.get去获取豆瓣API的相应的结果，并且将这个结果存储到数据库中。代码如下所示：
+
+```
+$scope.scan = function () {
+  $cordovaBarcodeScanner
+    .scan()
+    .then(function (barcodeData) {
+      $scope.info = barcodeData.text;
+      $http.get("https://api.douban.com/v2/book/isbn/" + barcodeData.text).success(function (data) {
+        $scope.detail = data;
+        saveToDatabase(data, barcodeData);
+      });
+    }, function (error) {
+      alert(error);
+    });
+}
+```    
+
+随后，我们就可以创建我们的代码来保存数据到数据库中。
+
+###Step 2: 存储数据库
+
+开始之前，我们需要添加Cordova的SQLite插件：
+
+    cordova plugin add https://github.com/litehelpers/Cordova-sqlite-storage.git
+
+
+在系统初始化的时候，创建对应的数据库及其表。
+
+```javascript
+if(window.cordova) {
+  //$cordovaSQLite.deleteDB("my.db");
+  db = $cordovaSQLite.openDB("my.db");
+} else {
+  db = window.openDatabase("my.db", "1.0", "bookshelf", -1);
+}
+$cordovaSQLite.execute(db, "CREATE TABLE IF NOT EXISTS bookshelf (id integer primary key, title text, image text, publisher text, author text, isbn text, summary text)");
+```
+
+接着，我们就可以上一步获取的数据取出相应的字段，调用bookshelfDB服务将其存储到数据库中。
+
+```javascript
+function saveToDatabase(data, barcodeData) {
+  bookshelfDB.add({
+    title: data.title,
+    image: data.image,
+    publisher: data.publisher,
+    author: data.author,
+    summary: data.summary,
+    isbn: barcodeData.text
+  });
+}
+```    
+
+下面就是我们的bookshelfDB服务，我们实现了get、add、remove、update，即CRUD。
+
+```javascript
+.factory('bookshelfDB', function($cordovaSQLite, DBA) {
+	var self = this;
+	self.all = function() {
+		return DBA.query("SELECT id, title, image, publisher, author, isbn, summary FROM bookshelf")
+			.then(function(result){
+				return DBA.getAll(result);
+			});
+	};
+	self.get = function(memberId) {
+		var parameters = [memberId];
+		return DBA.query("SELECT id, title, image, publisher, author, isbn, summary FROM bookshelf WHERE id = (?)", parameters)
+			.then(function(result) {
+				return DBA.getById(result);
+			});
+	};
+	self.add = function(member) {
+		var parameters = [member.id, member.title, member.image, member.publisher, member.author, member.isbn, member.summary];
+		return DBA.query("INSERT INTO bookshelf (id, title, image, publisher, author, isbn, summary) VALUES (?,?,?,?,?,?,?)", parameters);
+	};
+	self.remove = function(member) {
+		var parameters = [member.id];
+		return DBA.query("DELETE FROM bookshelf WHERE id = (?)", parameters);
+	};
+	self.update = function(origMember, editMember) {
+		var parameters = [editMember.id, editMember.title, origMember.id];
+		return DBA.query("UPDATE bookshelf SET id = (?), title = (?) WHERE id = (?)", parameters);
+	};
+	return self;
+})
+```	
+
+###练习建议
+
+制作专属Badge制作
+===
+
+概况
+---
+
+### 背景
+
 前几天，再次看到一些CI的Badge的时候，就想着要做一个自己的Badge:
 
-![Badge][1]
+![Badge](./images/badge.png)
 
 接着，我就找了个图形工具简单地先设计了下面的一个Badge:
 
-![Demo][2]
+![Demo](./images/demo.png)
 
 生成的格式是SVG，接着我就打开SVG看看里面发现了什么。
 
@@ -31,8 +532,13 @@
 
 看了看代码很简单，我就想这可以用代码生成——我就可以生成出不同的样子了。
 
-SVG与SVGWrite
----
+### ShowCase
+
+![Finally](./images/finally-brand.jpg)
+
+代码： GitHub: [https://github.com/phodal/brand](https://github.com/phodal/brand)
+
+###SVG与SVGWrite
 
 SVG就是一个XML
 
@@ -41,6 +547,11 @@ SVG就是一个XML
 要对这个XML进行修改也是一件很容易的事。只是，先找了PIL发现不支持，就找到了一个名为SVGWrite的工具。
 
 > A Python library to create SVG drawings.
+
+步骤
+---
+
+### Step 1: 基本图形
 
 示例代码如下:
 
@@ -71,12 +582,11 @@ dwg.save()
 
 发现和上面的样式几乎是一样的，就顺手做了剩下的几个。然后想了想，我这样做都一样，一点都不好看。
 
-高级Badge
----
+### Step 2: 高级Badge
 
 第一眼看到
 
-![Idea Prototype][4]
+![Idea Prototype](./images/brand-idea-prototype.jpg)
 
 我就想着要不和这个一样好了，不就是画几条线的事么。
 
@@ -102,31 +612,586 @@ dwg.save()
 
 就有了下面的图，于是我又按照这种感觉来了好几下
 
-![Finally][3]
+![Finally](./images/finally-brand.jpg)
 
-最后代码
+
+
+
+Web文本编辑器
+=====
+
+概况
 ---
 
-GitHub: [https://github.com/phodal/brand](https://github.com/phodal/brand)
+### 背景
+
+### ShowCase
+
+![Screenshot](./images/congee.jpg)
+
+GitHub: [https://github.com/phodal/congee](https://github.com/phodal/congee)
+
+### CKEditor + Ractive
+
+选用怎样的前端框架是一个有趣的话题，我需要一个数据绑定和模板。首先，我排除了React这个框架，我觉得他的模板会给我带来一堆麻烦事。Angluar是一个不错的选择，但是考虑Angluar 2.0就放弃了，Backbone也用了那么久。Knockout.js又进入了我的视野，但是后来我发现数据绑定到模板有点难。最后选了Ractive，后来发现果然上手很轻松。
+
+Ractive这个框架比React诞生早了一个月，还是以DOM为核心。Ractive自称是一个模板驱动UI的库，在Github上说是下一代的DOM操作。因为Virtual Dom的出现，这个框架并没有那么流行。 
+
+起先，这个框架是在卫报创建的用于产生新闻的应用程序 。有很多工具可以帮助我们构建Web应用程序 ，但是很少会考虑基本的问题：HTML，一个优秀的静态模板，但是并没有为交互设计。Ractive可以将一个模板插到DOM中，并且可以动态的改变它。
+
+步骤
+---
+
+在创建这个项目的时候，我的迭代过程大致如下：
+
+ - 创建hello,world —— 结合不同的几个框架
+ - 创建基本的样式集
+ - 引用ColorPicker来对颜色进行处理
+ - 重构代码
 
 
-  [1]: /static/media/uploads/badge.png
-  [2]: /static/media/uploads/demo.png
-  [3]: /static/media/uploads/finally-brand.jpg
-  [4]: /static/media/uploads/brand-idea-prototype.jpg
+###Step 1: hello,world
+
+下面是一个简单的hello，world。
+
+```html
+  <script id='template' type='text/ractive'>
+    <p>Hello, {{name}}!</p>
+  </script>
+  
+    <script>
+    var ractive = new Ractive({
+      template: '#template',
+      data: { name: 'world' }
+    });
+  </script>
+```
+
+这个hello，world和一般的MVC框架并没有太大区别，甚至和我们用的Backbone很像。然后，让我们来看一个事件的例子：
+
+```javascript
+listView = new Ractive({
+    el: 'sandboxTitle',
+    template: listTemplate,
+    data: {color: config.defaultColor, 'fontSize': config.defaultFontSize}
+  });
+
+  listView.on('changeColor', function (args) {
+    listView.set('color', args.color);
+  });
+```
+
+这是在监听，意味着你需要在某个地方Fire这个事件：
+
+```javascript
+titleView.fire('changeColor', {color: color.toHexString()});
+```
+
+接着，问题来了，这和我们jQuery的on，或者React的handleClick似乎没有太大的区别。接着Component来了：
+
+```javascript
+  var Grid = Ractive.extend({
+    isolated: false,
+    template: parasTemplate,
+    data: {
+    }
+  });
+
+  var dataValue = 5;
+  var category = 'category-3';
+
+  var color = config.defaultColor;
+
+  parasView = new Ractive({
+    el: 'parasSanbox',
+    template: '<Grid Style="{{styles}}" />',
+    components: {Grid: Grid},
+    data: {
+      styles: [
+        {section_style: 'border: 2px dotted #4caf50; margin: 8px 14px; padding: 10px; border-radius: 14px;', p_style: 'font-size: 14px;', color: color,  data_value: dataValue, category: category},
+      ]
+    }
+  });
+
+  parasView.on('changeColor', function(args) {
+    parasView.findComponent('Grid').set('Style.*.color', args.color);
+  });
+```
+
+上面是在[https://github.com/phodal/congee](https://github.com/phodal/congee)中用到的多个模板的View，他们用了同一个component。
+
+对比和介绍就在这里结束了，我们就可以开始这个项目的实战了。
+
+### Step 2: Require.js模块化
+
+同样的在这里，我们也使用Require.js来作模块化和依赖管理。我们的项目的配置如下：
+
+```javascript
+require(['scripts/app', 'ractive', 'scripts/views/titleView', 'scripts/views/hrView', 'scripts/views/parasView', 'scripts/views/followView', 'jquery', 'spectrum'],
+  function (App, Ractive, TitleView, ParasView, HRView, FollowView, $) {
+    'use strict';
+
+    App.init();
+    Ractive.DEBUG = false;
+    var config = App.config;
+
+    var titleView = TitleView.init(config);
+    var hrView = HRView.init(config);
+    var parasView = ParasView.init(config);
+    var followView = FollowView.init(config);
+
+    App.colorPicker(function (color) {
+      hrView.fire('changeColor', {color: color.toHexString()});
+      titleView.fire('changeColor', {color: color.toHexString()});
+      parasView.fire('changeColor', {color: color.toHexString()});
+      followView.fire('changeColor', {color: color.toHexString()});
+    });
+
+    $('input#mpName').keyup(function () {
+      followView.fire('changeName', {mpName: $(this).val()});
+    });
+  });
+```  
+
+在那之前，你自然需要先clone代码。然后在这里我们不同的几个模块进行初始化，并且为colorPicker配置了相应的监听事件。现在，让我们先到App模块中，看看我们做了些什么事？
+
+###Step 3: 初始化
+
+初始化模块一共分为两部分，一部分是对CKEditor的初始化，一部分则是对colorPicker的初始化。
+
+#### CKEditor初始化
+
+CKEditor自身的编辑器配置比较长，我们就不在这里面列出这些代码了。
+
+```javascript
+	var init = function () {
+    /**
+     * @license Copyright (c) 2003-2015, CKSource - Frederico Knabben. All rights reserved.
+     * For licensing, see LICENSE.md or http://ckeditor.com/license
+     */
+
+    CKEDITOR.editorConfig = function (config) {
+      // ...
+    };
+    var congee = CKEDITOR.replace('congee', {
+      uiColor: '#fafafa'
+    });
+
+    congee.on('change', function (evt) {
+
+    });
+
+    congee.on('instanceReady', function (ev) {
+      $('.tabset8').pwstabs({
+        effect: 'slideleft',
+        defaultTab: 1,
+        tabsPosition: 'vertical',
+        verticalPosition: 'left'
+      });
+      $('#Container').mixItUp().on('click', '.mix', function (event) {
+        var template = $(event.currentTarget).html();
+        congee.insertHtml(template);
+      });
+    });
+
+    $(document).ready(function () {
+      $('#Container').niceScroll({
+        mousescrollstep: 40
+      });
+    });
+```
+
+``instanceReady``事件主要就是在编程器初始化后进行的。因此我们在这里初始化了jQuery插件PWS Tabs，以及jQuery插件mixItUp，他们用于进行页面的排版。
+
+#### ColorPicker初始化
+
+下面的代码便是对ColorPicker进行初始化，我们设置了几个常用的颜色放在调色板上。
+
+```javascript
+ var colorPicker = function (changeCB) {
+    $('#colorpicker').spectrum({
+      showPaletteOnly: true,
+      togglePaletteOnly: true,
+      togglePaletteMoreText: 'more',
+      togglePaletteLessText: 'less',
+      color: '#4caf50',
+      palette: [
+        ['#1abc9c', '#16a085', '#2ecc71', '#27ae60', '#4caf50', '#8bc34a', '#cddc39'],
+        ['#3498db', '#2980b9', '#34495e', '#2c3e50', '#2196f3', '#03a9f4', '#00bcd4', '#009688'],
+        ['#e74c3c', '#c0392b', '#f44336'],
+        ['#e67e22', '#d35400', '#f39c12', '#ff9800', '#ff5722', '#ffc107'],
+        ['#f1c40f', '#ffeb3b'],
+        ['#9b59b6', '#8e44ad', '#9c27b0', '#673ab7', '#e91e63', '#3f51b5'],
+        ['#795548'],
+        ['#9e9e9e', '#607d8b', '#7f8c8d', '#95a5a6', '#bdc3c7'],
+        ['#ecf0f1', 'efefef']
+      ],
+      change: changeCB
+    });
+  };
+```  
+
+而实际上在这里我们已经完成了大部分的工作。
+
+###Step 4: 创建对应的View
+
+在这个项目里，比较麻烦的地方就是使用同样的颜色来显示一个模板，如下的代码是用于显示水平线的模板：
+
+```
+{{#hrStyle}}
+<div class="mix {{.category}}" data-value={{.data_value}}>
+  <section {{#section_style}}style="{{.section_style}}"{{/section_style}}>
+    <p style="{{.p_style}}{{#color}};border-color: {{.color}};{{/color}}"></p>
+  </section>
+</div>
+{{/hrStyle}}
+```
+
+下面的代码就是对应的View:
+
+```
+      parasView = new Ractive({
+        el: 'sandboxHr',
+        template: '<Grid hrStyle="{{styles}}" />',
+        components: {Grid: Grid},
+        data: {
+          styles: [
+            {section_style: '', p_style: 'background-color: #fff;border-top: 1px solid', color: color,  data_value: dataValue, category: category},
+            {section_style: '', p_style: 'background-color: #fff;border-top: 3px double', color: color, data_value: dataValue, category: category},
+            {section_style: '', p_style: 'background-color: #fff;border-top: 1px dashed', color: color, data_value: dataValue, category: category},
+            {section_style: '', p_style: 'background-color: #fff;border-top: 1px dotted', color: color, data_value: dataValue, category: category},
+            {section_style: '', p_style: 'background-color: #fff;border-top: 2px dashed', color: color, data_value: dataValue, category: category},
+            {section_style: '', p_style: 'background-color: #fff;border-top: 2px dotted', color: color, data_value: dataValue, category: category},
+            {section_style: '', p_style: 'background-color: #fff;border-bottom: 1px solid #fff;border-top: 1px solid', color: color,  data_value: dataValue, category: category},
+            {section_style: 'border-top: 1px solid #8c8b8b; border-bottom: 1px solid #fff;', p_style: 'content: "";display: block;margin-top: 2px;border-top: 1px solid #8c8b8b;border-bottom: 1px solid #fff;', data_value: dataValue, category: category},
+            {section_style: '', p_style: 'height: 6px;background: url(\'styles/images/hr/hr-11.png\') repeat-x 0 0;border: 0;', data_value: dataValue, category: category},
+            {section_style: '', p_style: 'height: 6px;background: url(\'styles/images/hr/hr-12.png\') repeat-x 0 0;border: 0;', data_value: dataValue, category: category},
+            {section_style: '', p_style: 'height: 10px;border: 0;box-shadow: 0 10px 10px -10px #8c8b8b inset;', data_value: dataValue, category: category},
+            {section_style: '', p_style: 'border: 0;height: 1px;background-image: -webkit-linear-gradient(left, #f0f0f0, #8c8b8b, #f0f0f0);background-image: -moz-linear-gradient(left, #f0f0f0, #8c8b8b, #f0f0f0);background-image: -ms-linear-gradient(left, #f0f0f0, #8c8b8b, #f0f0f0);background-image: -o-linear-gradient(left, #f0f0f0, #8c8b8b, #f0f0f0);', data_value: dataValue, category: category}
+          ]
+        }
+      });
+```      
+
+我们所做的只是拿出每个不同的布局，再将这些布局显示到页面上。最后在值被修改时，改变这其中的值：
+
+```
+parasView.on('changeColor', function(args) {
+  parasView.findComponent('Grid').set('hrStyle.*.color', args.color);
+});
+```      
+
+###练习建议
 
 
-​尽管没有特别的动力去构建一个全新的CMS，但是我还是愿意去撰文一篇来书写如何去做这样的事——编辑-发布-开发分离模式是如何工作的。微服务是我们对于复杂应用的一种趋势，编辑-发布-开发分离模式则是另外一种趋势。在上篇文章《[Repractise架构篇一: CMS的重构与演进](https://github.com/phodal/repractise/blob/gh-pages/chapters/refactor-cms.md)》中，我们说到编辑-发布-开发分离模式。
+JavaScript打造Slide应用
+===================
 
-##系统架构
+概况
+---
 
-如先前提到的，Carrot使用了下面的方案来搭建他们的静态内容的CMS。
+### 背景
 
-![Carrot][1]
+又开始造一个新的轮子了，不过这次的起因比较简单，是想重新发明一个更好的Slide框架 —— EchoesWorks。如名字所言，我所需要的是一个``回声``工坊，即将博客、Slide重新回放。
+
+###Showcase
+
+![EchoesWorks](./images/echoesworks.jpg)
+
+GitHub代码： [https://github.com/phodal/echoesworks](https://github.com/phodal/echoesworks)
+
+### 需求
+
+当前我们有不同的方式可以记录我们的想法、博客、过程，如视频、音频、博客、幻灯片等等。
+
+然而这些并非那么完美，让我们说说这些方式的一些缺陷吧。
+
+1. 视频。有很多技术视频从开始到结束，只有PPT，然后我们就为了这张PPT和声音下了几百M的视频。即使在今天网速很快，但是这并不代表我们可以在我们的手机上放下很多的视频。
+
+2. 音频。音频所受到的限制我想大家都很清楚。什么也不知道~~，什么也看不到，只能听。
+
+3. 博客。博客的主要缺点可能就是不够直接，有时会有点啰嗦。
+
+4. 幻灯片。一个好的PPT，也就意味着上面的内容是很少的。即如果没有人说的时候，就缺少真正有用的东西。
+
+5. 代码。我们真的需要在另外打开一个网址来看代码么?
+
+于是，``EchoesWorks``出现了，它可以支持下面的一些功能：
+
+ - 支持 Markdown
+ - Github代码显示
+ - 全屏背景图片
+ - 左/右侧图片支持
+ - 进度条
+ - 自动播放
+ - 字幕
+ - 分屏控制
+
+步骤
+---
+
+### Step 1: 基本的Slide功能
+
+由于我是一个懒人，所以在实现基本的Slide功能时，我找到了一个名为``bespoke``的迷你框架。原理大致和大家分享一下，在这个库里一共有下面几个函数：
+
+ - readURL() 读取URL来获取当前的页数，将跳转到相应的页数。
+ - activate(index, customData) 主要的函数，实际上就是切换className而已——将新的页面标记为'active'。
+ - writeURL(index) 切换slide的时候，更新URL的hash
+ - step(offset, customData) 计算页面
+ - on(eventName, callback) 事件监听函数
+ - fire(eventName, eventData) 事件触发函数
+ - createEventData (el, eventData) 创建事件的数据
+
+大致的功能就如上所说的，相当简单。
+
+### Step 2: 解析Markdown
+
+接着，我们就可以创建解析Markdown的功能了，遗憾的是这里的代码我也是用别人的——``micromarkdown``，一个非常简单的Markdown解析器。
+
+### Step 3: 事件处理
+
+在我们完成了基本的Slide功能后，我们就可以处理一些特殊的事件，如移动设备和键盘事件。在EW初始化时，我们可以会trigger一个名为``ew:slide:init``的事件来告诉其他组件系统已经初始化了。这时在我们对应的事件处理函数中，我们就可以判断它是不是移动设备:
+
+```javascript
+slides = document.getElementsByTagName('section');
+syncSliderEventHandler();
+
+if (slides && isTouchDevice && window.slide) {
+	touchDeviceHandler();
+}
+```
+
+如果是移动设备，我们会额外的监听三个事件：
+
+ - touchstart
+ - touchend
+ - touchmove
+
+如果是键盘输入的话，那么依据不同的按键做不同的处理：
+
+```javascript
+document.addEventListener("keyup", function (event) {
+	var keyCode = event.keyCode;
+	if (keyCode === TAB || ( keyCode >= SPACE && keyCode <= PAGE_DOWN ) || (keyCode >= LEFT && keyCode <= DOWN)) {
+		switch (keyCode) {
+			case  PAGE_UP:
+			case  LEFT:
+			case  UP:
+				window.slide.prev();
+				break;
+			case TAB:
+			case SPACE:
+			case PAGE_DOWN:
+			case  RIGHT:
+			case DOWN:
+				window.slide.next();
+				break;
+		}
+
+		event.preventDefault();
+	}
+});
+```
+
+如向上就展示下一张幻灯片，向下就展示下一张幻灯片。
+
+### Step 4: 解析字幕
+
+在EchoesWorks中提供了一个很有趣的功能——类似于听歌时的歌词显示，并且可以自动播放和切换。它并没有用到什么特殊的技能，只是简单的对比时间，并且替换文字。
+
+```javascript
+if (that.time < nextTime && words.length > 1) {
+		var length = words.length;
+		var currentTime = that.parser.parseTime(that.data.times)[currentSlide];
+		var time = nextTime - currentTime;
+		var average = time / length * 1000;
+		var i = 0;
+		document.querySelector('words').innerHTML = words[i].word;
+
+		timerWord = setInterval(function () {
+			i++;
+			if (i - 1 === length) {
+				clearInterval(timerWord);
+			} else {
+				document.querySelector('words').innerHTML = words[i].word;
+			}
+		}, average);
+	}
+	return timerWord;
+}
+```
+
+### Step 5: 进度条
+
+一如既往的，我们的进度条，还是用别人已经写好的组件。这里我们用到的是nanobar。在Nanobar里，我们定义了一个go函数，在这个函数里来转换进度条：
+
+```
+Nanobar.prototype.go = function (p) {
+	this.bars[0].go(p);
+	if (p == 100) {
+		init.call(this);
+	}
+};
+```
+
+在我们的slide文件里，再对其进行处理：
+
+```
+window.bar.go(100 * ( index + 1) / slides.length);
+```
+
+
+### Step 6: 同步
+
+在这里并没有什么特别高级的用法，只是简单的事件监听
+
+```javascript
+function handler() {
+	window.slide.slide(parseInt(localStorage.getItem('echoesworks'), 10));
+}
+
+if (window.addEventListener) {
+	window.addEventListener("storage", handler, false);
+} else {
+               // IE
+	window.attachEvent("onstorage", handler);
+}
+```
+
+即，当监听到调用``storage``的方法，就会跳转到相应的页面。
+
+正常情况下，我们只用一个标签来展示我们的slide。当我们有另外一个标签的时候，我们就可以存储当前的slide。
+
+```javascript
+localStorage.setItem('echoesworks', index);
+```
+
+这样就可以实现，在一个页面到下一页时，另外一个标签也会跳到下一页。
+
+### 练习建议
+  
+
+编辑-发布-分离应用
+==========
+
+概况
+---
+
+### 背景: 编辑-发布-开发分离
+
+在这种情形中，编辑能否完成工作就不依赖于网站——脱稿又少了 个借口。这时候网站出错的概率太小了——你不需要一个缓存服务器、HTTP服务器，由于没有动态生成的内容，你也不需要守护进程。这些内容都是静态文件，你可以将他们放在任何可以提供静态文件托管的地方——CloudFront、S3等等。或者你再相信自己的服务器，Nginx可是全球第二好（第一还没出现）的静态文件服务器。
+
+开发人员只在需要的时候去修改网站的一些内容。
+
+So，你可能会担心如果这时候修改的东西有问题了怎么办。
+
+1. 使用这种模式就意味着你需要有测试来覆盖这些构建工具、生成工具。
+2. 相比于自己的代码，别人的CMS更可靠？
+
+需要注意的是如果你上一次构建成功，你生成的文件都是正常的，那么你只需要回滚开发相关的代码即可。旧的代码仍然可以工作得很好。
+
+其次，由于生成的是静态文件，查错的成本就比较低。
+
+最后，重新放上之前的静态文件。
+  
+> 动态网页是下一个要解决的难题。我们从数据库中读取数据，再用动态去渲染出一个静态页面，并且缓存服务器来缓存这个页面。既然我们都可以用Varnish、Squid这样的软件来缓存页面——表明它们可以是静态的，为什么不考虑直接使用静态网页呢？
+
+为了实现之前说到的``编辑-发布-开发分离``的CMS，我还是花了两天的时间打造了一个面向普通用户的编辑器。效果截图如下所示：
+
+![Echeveria Editor](./images/eche-editor-screenshot.png)
+
+作为一个普通用户，这是一个很简单的软件。除了Electron + Node.js + React作了一个140M左右的软件，尽管打包完只有40M左右 ，但是还是会把用户吓跑的。不过作为一个快速构建的原型已经很不错了——构建速度很快、并且运行良好。
+
+尽管这个界面看上去还是稍微复杂了一下，还在试着想办法将链接名和日期去掉——问题是为什么会有这两个东西？
+
+#### 从Schema到数据库
+
+我们在我们数据库中定义好了Schema——对一个数据库的结构描述。在《[编辑-发布-开发分离](https://www.phodal.com/blog/editing-publishing-coding-seperate/)
+》一文中我们说到了echeveria-content的一个数据文件如下所示：
+
+```javascript
+  {
+    "title": "白米粥",
+    "author": "白米粥",
+    "url": "baimizhou",
+    "date": "2015-10-21",
+    "description": "# Blog post \n  > This is an example blog post \n Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ",
+    "blogpost": "# Blog post \n  > This is an example blog post \n Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. \n Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum."
+  }
+```
+
+比起之前的直接生成静态页面这里的数据就是更有意思地一步了，我们从数据库读取数据就是为了生成一个JSON文件。何不直接以JSON的形式存储文件呢？
+
+我们都定义了这每篇文章的基本元素:
+
+1. title
+2. author
+3. date
+4. description
+5. content
+6. url
+
+即使我们使用NoSQL我们也很难逃离这种模式。我们定义这些数据，为了在使用的时候更方便。存储这些数据只是这个过程中的一部分，下部分就是取出这些数据并对他们进行过滤，取出我们需要的数据。
+
+Web的骨架就是这么简单，当然APP也是如此。难的地方在于存储怎样的数据，返回怎样的数据。不同的网站存储着不同的数据，如淘宝存储的是商品的信息，Google存储着各种网站的数据——人们需要不同的方式去存储这些数据，为了更好地存储衍生了更多的数据存储方案——于是有了GFS、Haystack等等。运营型网站想尽办法为最后一公里努力着，成长型的网站一直在想着怎样更好的返回数据，从更好的用户体验到机器学习。而数据则是这个过程中不变的东西。
+
+尽管，我已经想了很多办法去尽可能减少元素——在最开始的版本里只有标题和内容。然而为了满足我们在数据库中定义的结构，不得不造出来这么多对于一般用户不友好的字段。如链接名是为了存储的文件名而存在的，即这个链接名在最后会变成文件名：
+
+```javascript
+repo.write('master', 'contents/' + data.url + '.json', stringifyData, 'Robot: add article ' + data.title, options, function (err, data) {
+      if(data.commit){
+        that.setState({message: "上传成功" + JSON.stringify(data)});
+        that.refs.snackbar.show();
+        that.setState({
+          sending: 0
+        });
+      }
+    });
+```    
+
+然后，上面的数据就会变成一个对象存储到“数据库”中。
+
+今天 ，仍然有很多人用Word、Excel来存储数据。因为对于他们来说，这些软件更为直接，他们简单地操作一下就可以对数据进行排序、筛选。数据以怎样的形式存储并不重要，重要的是他们都以文件的形式存储着。
+
+#### git作为NoSQL数据库
+
+在控制台中运行一下 ``man git``你会得到下面的结果:
+
+![Man Git](./images/man-git.png)
+
+这个答案看起来很有意思——不过这看上去似乎无关主题。
+
+不同的数据库会以不同的形式存储到文件中去。blob是git中最为基本的存储单位，我们的每个content都是一个blob。redis可以以rdb文件的形式存储到文件系统中。完成一个CMS，我们并不需要那么多的查询功能。
+
+> 这些上千年的组织机构，只想让人们知道他们想要说的东西。
+
+我们使用NoSQL是因为：
+
+1. 不使用关系模型
+2. 在集群中运行良好
+3. 开源
+4. 无模式
+5. 数据交换格式
+
+我想其中只有两点对于我来说是比较重要的``集群``与``数据格式``。但是集群和数据格式都不是我们要考虑的问题。。。
+
+我们也不存在数据格式的问题、开源的问题，什么问题都没有。。除了，我们之前说到的查询——但是这是可以解决的问题，我们甚至可以返回不同的历史版本的。在这一点上git做得很好，他不会像WordPress那样存储多个版本。
+
+#### git + JSON文件
+
+JSON文件 + Nginx就可以变成这样一个合理的API，甚至是运行方式。我们可以对其进行增、删、改、查，尽管就当前来说查需要一个额外的软件来执行，但是为了实现一个用得比较少的功能，而去花费大把的时间可能就是在浪费。
+
+git的“API”提供了丰富的增、删、改功能——你需要commit就可以了。我们所要做的就是:
+
+1. git commit
+2. git push
+Carrot使用了下面的方案来搭建他们的静态内容的CMS。
+
+![Carrot](./images/carrot.png)
 
 在这个方案里内容是用Contentful来发布他们的内容。而在我司[ThoughtWorks](https://www.thoughtworks.com/)的官网里则采用了Github来管理这些内容。于是如果让我们写一个基于Github的CMS，那么架构变成了这样：
 
-![Github 编辑-发布-开发][2]
+![Github 编辑-发布-开发](./images/travis-edit-publish-code.png)
 
 或许你也用过Hexo / Jekyll / Octopress这样的静态博客，他们的原理都是类似的。我们有一个代码库用于生成静态页面，然后这些静态页面会被PUSH到Github Pages上。
 
@@ -143,7 +1208,7 @@ GitHub: [https://github.com/phodal/brand](https://github.com/phodal/brand)
 
 So，这一个过程是如何进行的。
 
-###用户场景
+### 用户场景
 
 整个过程的Pipeline如下所示：
 
@@ -154,7 +1219,10 @@ So，这一个过程是如何进行的。
 
 这里还依赖于WebHook这个东西——还没想到一个合适的解决方案。下面，我们对里面的内容进行一些拆解，Content里面由于是JSON就不多解释了。
 
-##Builder: 构建工具
+步骤
+---
+
+### Step 1: 构建工具
 
 Github与Travis之间，可以做一个自动部署的工具。相信已经有很多人在Github上玩过这样的东西——先在Github上生成Token，然后用travis加密：
 
@@ -222,7 +1290,7 @@ git push -q upstream HEAD:gh-pages
 grunt.registerTask('default', ['clean', 'assemble', 'copy']);
 ```
 
-##Code: 静态页面生成
+### Step 2: 静态页面生成
 
 Assemble是一个使用Node.js，Grunt.js，Gulp，Yeoman 等来实现的静态网页生成系统。这样的生成器有很多，Zurb Foundation, Zurb Ink, Less.js / lesscss.org, Topcoat, Web Experience Toolkit等组织都使用这个工具来生成。这个工具似乎上个Release在一年多以前，现在正在开始0.6。虽然，这并不重要，但是还是顺便一说。
 
@@ -288,126 +1356,21 @@ grunt.registerTask('dev', ['default', 'connect:server', 'watch:site']);
 
 用于开发阶段这样的代码就够了，这个和你使用WebPack + React 似乎相差不了多少。
 
-##编辑-发布-开发分离
+Google Map与Solr实现多边形搜索
+===
 
-在这种情形中，编辑能否完成工作就不依赖于网站——脱稿又少了 个借口。这时候网站出错的概率太小了——你不需要一个缓存服务器、HTTP服务器，由于没有动态生成的内容，你也不需要守护进程。这些内容都是静态文件，你可以将他们放在任何可以提供静态文件托管的地方——CloudFront、S3等等。或者你再相信自己的服务器，Nginx可是全球第二好（第一还没出现）的静态文件服务器。
+概况
+---
 
-开发人员只在需要的时候去修改网站的一些内容。
+### 背景
 
-So，你可能会担心如果这时候修改的东西有问题了怎么办。
+### Showcase
 
-1. 使用这种模式就意味着你需要有测试来覆盖这些构建工具、生成工具。
-2. 相比于自己的代码，别人的CMS更可靠？
+![Google Map Solr](./images/gmap-solr.jpg)
 
-需要注意的是如果你上一次构建成功，你生成的文件都是正常的，那么你只需要回滚开发相关的代码即可。旧的代码仍然可以工作得很好。
+GitHub [https://github.com/phodal/gmap-solr](https://github.com/phodal/gmap-solr)
 
-其次，由于生成的是静态文件，查错的成本就比较低。
-
-最后，重新放上之前的静态文件。
-
-
-  [1]: /static/media/uploads/carrot.png
-  [2]: /static/media/uploads/travis-edit-publish-code.png
-  
- > 动态网页是下一个要解决的难题。我们从数据库中读取数据，再用动态去渲染出一个静态页面，并且缓存服务器来缓存这个页面。既然我们都可以用Varnish、Squid这样的软件来缓存页面——表明它们可以是静态的，为什么不考虑直接使用静态网页呢？
-
-为了实现之前说到的``编辑-发布-开发分离``的CMS，我还是花了两天的时间打造了一个面向普通用户的编辑器。效果截图如下所示：
-
-![Echeveria Editor][1]
-
-作为一个普通用户，这是一个很简单的软件。除了Electron + Node.js + React作了一个140M左右的软件，尽管打包完只有40M左右 ，但是还是会把用户吓跑的。不过作为一个快速构建的原型已经很不错了——构建速度很快、并且运行良好。
-
-尽管这个界面看上去还是稍微复杂了一下，还在试着想办法将链接名和日期去掉——问题是为什么会有这两个东西？
-
-##从Schema到数据库
-
-我们在我们数据库中定义好了Schema——对一个数据库的结构描述。在《[编辑-发布-开发分离](https://www.phodal.com/blog/editing-publishing-coding-seperate/)
-》一文中我们说到了echeveria-content的一个数据文件如下所示：
-
-```javascript
-	{
-	  "title": "白米粥",
-	  "author": "白米粥",
-	  "url": "baimizhou",
-	  "date": "2015-10-21",
-	  "description": "# Blog post \n  > This is an example blog post \n Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ",
-	  "blogpost": "# Blog post \n  > This is an example blog post \n Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. \n Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum."
-	}
-```
-
-比起之前的直接生成静态页面这里的数据就是更有意思地一步了，我们从数据库读取数据就是为了生成一个JSON文件。何不直接以JSON的形式存储文件呢？
-
-我们都定义了这每篇文章的基本元素:
-
-1. title
-2. author
-3. date
-4. description
-5. content
-6. url
-
-即使我们使用NoSQL我们也很难逃离这种模式。我们定义这些数据，为了在使用的时候更方便。存储这些数据只是这个过程中的一部分，下部分就是取出这些数据并对他们进行过滤，取出我们需要的数据。
-
-Web的骨架就是这么简单，当然APP也是如此。难的地方在于存储怎样的数据，返回怎样的数据。不同的网站存储着不同的数据，如淘宝存储的是商品的信息，Google存储着各种网站的数据——人们需要不同的方式去存储这些数据，为了更好地存储衍生了更多的数据存储方案——于是有了GFS、Haystack等等。运营型网站想尽办法为最后一公里努力着，成长型的网站一直在想着怎样更好的返回数据，从更好的用户体验到机器学习。而数据则是这个过程中不变的东西。
-
-尽管，我已经想了很多办法去尽可能减少元素——在最开始的版本里只有标题和内容。然而为了满足我们在数据库中定义的结构，不得不造出来这么多对于一般用户不友好的字段。如链接名是为了存储的文件名而存在的，即这个链接名在最后会变成文件名：
-
-```javascript
-repo.write('master', 'contents/' + data.url + '.json', stringifyData, 'Robot: add article ' + data.title, options, function (err, data) {
-      if(data.commit){
-        that.setState({message: "上传成功" + JSON.stringify(data)});
-        that.refs.snackbar.show();
-        that.setState({
-          sending: 0
-        });
-      }
-    });
-```    
-
-然后，上面的数据就会变成一个对象存储到“数据库”中。
-
-今天 ，仍然有很多人用Word、Excel来存储数据。因为对于他们来说，这些软件更为直接，他们简单地操作一下就可以对数据进行排序、筛选。数据以怎样的形式存储并不重要，重要的是他们都以文件的形式存储着。
-
-##git作为NoSQL数据库
-
-在控制台中运行一下 ``man git``你会得到下面的结果:
-
-![Man Git][2]
-
-这个答案看起来很有意思——不过这看上去似乎无关主题。
-
-不同的数据库会以不同的形式存储到文件中去。blob是git中最为基本的存储单位，我们的每个content都是一个blob。redis可以以rdb文件的形式存储到文件系统中。完成一个CMS，我们并不需要那么多的查询功能。
-
-> 这些上千年的组织机构，只想让人们知道他们想要说的东西。
-
-我们使用NoSQL是因为：
-
-1. 不使用关系模型
-2. 在集群中运行良好
-3. 开源
-4. 无模式
-5. 数据交换格式
-
-我想其中只有两点对于我来说是比较重要的``集群``与``数据格式``。但是集群和数据格式都不是我们要考虑的问题。。。
-
-我们也不存在数据格式的问题、开源的问题，什么问题都没有。。除了，我们之前说到的查询——但是这是可以解决的问题，我们甚至可以返回不同的历史版本的。在这一点上git做得很好，他不会像WordPress那样存储多个版本。
-
-###git + JSON文件
-
-JSON文件 + Nginx就可以变成这样一个合理的API，甚至是运行方式。我们可以对其进行增、删、改、查，尽管就当前来说查需要一个额外的软件来执行，但是为了实现一个用得比较少的功能，而去花费大把的时间可能就是在浪费。
-
-git的“API”提供了丰富的增、删、改功能——你需要commit就可以了。我们所要做的就是:
-
-1. git commit
-2. git push
-
-
-  [1]: /static/media/uploads/eche-editor-screenshot.png
-  [2]: /static/media/uploads/man-git.png  
-
-记录一下自己做的一个小东西，当然你也可以在github上找到它:[https://github.com/phodal/gmap-solr](https://github.com/phodal/gmap-solr)
-
-##Solr
+### Solr
 
 > Solr是一个高性能，采用Java5开发，基于Lucene的全文搜索服务器。同时对其进行了扩展，提供了比Lucene更为丰富的查询语言，同时实现了可配置、可扩展并对查询性能进行了优化，并且提供了一个完善的功能管理界面，是一款非常优秀的全文搜索引擎。
 
@@ -419,67 +1382,78 @@ git的“API”提供了丰富的增、删、改功能——你需要commit就�
 
 **Solr 安装**
 
-    brew install solr
+```bash
+brew install solr
+```
 
-##Gmap Solr Polygon 搜索实战
-
-思路:
+步骤
+---
 
 用Flask搭建一个简单的servrices，接着在前台用google的api，对后台发出请求。
 
-###Solr Flask
+### Step 1: Solr Flask
 
 由于，直接调用的是Solr的接口，所以我们的代码显得比较简单:
 
-	class All(Resource):
-	    @staticmethod
-	    def get():
-	        base_url = ''
-	        url = (base_url + 'select?q=' + request.query_string + '+&wt=json&indent=true')
-	        result = requests.get(url)
-	        return (result.json()['response']['docs']), 201, {'Access-Control-Allow-Origin': '*'}
+```python
+class All(Resource):
+    @staticmethod
+    def get():
+        base_url = ''
+        url = (base_url + 'select?q=' + request.query_string + '+&wt=json&indent=true')
+        result = requests.get(url)
+        return (result.json()['response']['docs']), 201, {'Access-Control-Allow-Origin': '*'}
 
 
-	api.add_resource(All, '/geo/')
-
+api.add_resource(All, '/geo/')
+```
 
 我们在前台需要做的便是，组装geo query。
 
-###Google map Polygon
+###Step 2: Google map Polygon
 
 在Google Map的API是支持Polygon搜索的，有对应的一个
 
-    google.maps.event.addListener(drawingManager, 'polygoncomplete', renderMarker);
+```javascript
+google.maps.event.addListener(drawingManager, 'polygoncomplete', renderMarker);
+```
 
 函数来监听，完成``polygoncomplete``时执行的函数，当我们完成搜索时，便执行``renderMarker``，在里面做的便是:
 
-    $.get('/geo/?' + query, function (results) {
-            for (var i = 0; i < results.length; i++) {
-                var location = results[i].geo[0].split(',');
-                var myLatLng = new google.maps.LatLng(location[0], location[1]);
-                var title = results[i].title;
-                marker = new google.maps.Marker({
-                    position: myLatLng,
-                    map: map,
-                    title: title
-                });
-
-                contentString = '<h1>City</h1><br/> address ' + i + '';
-
-                google.maps.event.addListener(marker, 'click', (function (marker, contentString, infowindow) {
-                    return function () {
-                        infowindow.setContent(contentString);
-                        infowindow.open(map, marker);
-                    };
-                })(marker, contentString, infowindow));
-            }
+```javascript
+$.get('/geo/?' + query, function (results) {
+    for (var i = 0; i < results.length; i++) {
+        var location = results[i].geo[0].split(',');
+        var myLatLng = new google.maps.LatLng(location[0], location[1]);
+        var title = results[i].title;
+        marker = new google.maps.Marker({
+            position: myLatLng,
+            map: map,
+            title: title
         });
+
+        contentString = '<h1>City</h1><br/> address ' + i + '';
+
+        google.maps.event.addListener(marker, 'click', (function (marker, contentString, infowindow) {
+            return function () {
+                infowindow.setContent(contentString);
+                infowindow.open(map, marker);
+            };
+        })(marker, contentString, infowindow));
+    }
+});
+```
 
 对应的去解析数据，并显示在地图上
    
 
-Growth
+一份代码打造跨平台应用
 ===
+
+概况
+---
+
+### 背景
 
 Web本身就是跨平台的，这意味着这中间存在着无限的可能性。
 
@@ -491,9 +1465,13 @@ Web本身就是跨平台的，这意味着这中间存在着无限的可能性�
  - Web版
  - 桌面版：Mac OS、Windows、GNU/Linux
 
+### ShowCase
+
 截图合并如下：
 
-![growth-full-platforms.png](/static/media/uploads/growth-full-platforms.jpg)
+![growth-full-platforms.png](./images/growth-full-platforms.jpg)
+
+### Ionic & Electron & Cordova
 
 而更重要的是它们使用了同一份代码——除了对特定设备进行一些处理就没有其他修改。相信全栈的你已经看出来了：
 
@@ -505,7 +1483,10 @@ Mobile = Cordova + Angular.js + Ionic
 
 除了前面的WebView不一样，后面都是Angular.js + Ionic。
 
-##从Web到混合应用，再到桌面应用
+步骤
+---
+
+###Step 1: 从Web到混合应用，再到桌面应用
 
 在最打开的时候它只是一个单纯的混合应用，我想总结一下我的学习经验，分享一下学习的心得，如：
 
@@ -519,7 +1500,7 @@ Mobile = Cordova + Angular.js + Ionic
  
 接着我用Ionic创建了这个应用，这是一个再普通不过的过程。在这个过程里，我一直使用Chrome在调度我的代码。因为我是Android用户，我有Google Play的账号，便发布了Android版本。这时候遇到了一个问题，我并没有Apple Developer账号(现在在申请ing。。)，而主要的用户对象程序员，这是一群**不土**的土豪。
 
-![iPHONE](/static/media/uploads/iphone.jpg)
+![iPHONE](./images/iphone.jpg)
 
 偶然间我才想到，我只要上传Web版本的代码就可以暂时性实现这个需求了。接着找了个AWS S3的插件，直接上传到了AWS S3上托管成静态文件服务。
 
@@ -527,7 +1508,7 @@ Mobile = Cordova + Angular.js + Ionic
 
 所以，最后我们的流程图就如下所示：
 
-![Growth Arch](/static/media/uploads/growth-arch.png)
+![Growth Arch](./images/growth-arch.png)
 
 除了显示到VR设备上，好像什么也不缺了。并且在我之前的文章《[Oculus + Node.js + Three.js 打造VR世界](https://github.com/phodal/oculus-nodejs-threejs-example)》，也展示了Web在VR世界的可能性。
 
@@ -536,15 +1517,15 @@ Mobile = Cordova + Angular.js + Ionic
 1. 响应式设计
 2. 平台/设备特定代码
 
-##响应式设计
+### Step 2: 响应式设计
 
 响应式设计可以主要依赖于Media Query，而响应式设计主要要追随的一点是不同的设备不同的显示，如：
 
-![full-platforms.jpg](/static/media/uploads/full-platforms.jpg)
+![full-platforms.jpg](./images/full-platforms.jpg)
 
 这也意味着，我们需要对不同的设备进行一些处理，如在大的屏幕下，我们需要展示菜单：
 
-![gnu-linux.png](/static/media/uploads/gnu-linux.jpg)
+![gnu-linux.png](./images/gnu-linux.jpg)
 
 而这可以依赖于Ionic的**expose-aside-when="large"**，而并非所有的情形都是这么简单的。如我最近遇到的问题就是图片缩放的问题，之前的图片针对的都是手机版——经过了一定的缩放。
 
@@ -552,17 +1533,17 @@ Mobile = Cordova + Angular.js + Ionic
 
 而这个问题相比于平台特定问题则更容易解决。
 
-##平台特定代码
+### Step 3: 平台特定代码
 
 对于特定平台才有的问题就不是一件容易解决的事，分享一下：
 
-###存储
+#### 存储
 
 我遇到的第一个问题是**数据存储**的问题。最开始的时候，我只需要开始混合应用。因此我可以用**Preferences**、或者**SQLite**来存储数据。
 
 后来，我扩展到了Web版，我只好用LocalStoarge。于是，我就开始抽象出一个**$storageServices**来做相应的事。接着遇到一系列的问题，我舍弃了原有的方案，直接使用LocalStoarge。
 
-###数据分析
+#### 数据分析
 
 为了开发方便，我使用Google Analytics来分析用户的行为——毕竟数据对我来说也不是特别重要，只要可以看到有人使用就可以了。
 
@@ -585,7 +1566,7 @@ Mobile = Cordova + Angular.js + Ionic
 
 这样在我调试的时候我只需要打个Log，在产品环境时就会Track。
 
-###更新
+#### 自动更新
 
 同样的，对于Android用户来说，他们可以选择自行下载更新，所以我需要针对Android用户有一个自动更新：
 
@@ -596,7 +1577,7 @@ if(isAndroid) {
 }
 ```    
 
-###桌面应用
+#### 桌面应用
 
 对于桌面应用来说也会有类似的问题，我遇到的第一个问题是Electron默认开启了AMD。于是，直接删之：
 
@@ -613,26 +1594,39 @@ if(typeof module !== 'undefined' && module && module.exports){
 
 如果有一天，我有钱开放这个应用的应用号，那么我就会再次献上这个图：
 
-![六边形架构](/static/media/uploads/hexoarch.png)
+![六边形架构](./images/hexoarch.png)
 
-##未来
+### 未来
 
 我就开始思索这个问题，未来的趋势是合并到一起，而这一个趋势在现在就已经是完成时了。
 
 那么未来呢？你觉得会是怎样的？
 
-搜索引擎是个好东西，GIS也是个好东西。当前还有Django和Ionic。最后效果图
+Ionic ElasticSearch打造O2O应用
+===
 
-![elasticsearch_ionic_map][1] ![elasticsearch_ionic_info_page][2]
+概况
+---
 
+### 背景
 
-##构架设计
+搜索引擎是个好东西，GIS也是个好东西。当前还有Django和Ionic。
+
+### Showcase
+
+最后效果图
+
+![elasticsearch_ionic_map](./images/elasticsearch_ionic_map.jpg) 
+
+![elasticsearch_ionic_info_page](./images/elasticsearch_ionic_info_page.jpg)
+
+### 构架设计
 
 对我们的需求进行简要的思考后，设计出了下面的一些简单的架构。
 
-![Django ElasticSearch Ionic 架构][3]
+![Django ElasticSearch Ionic 架构](./images/struct.png)
 
-###GIS架构说明 —— 服务端
+#### 服务端
 
 简单说明:
 
@@ -643,7 +1637,7 @@ if(typeof module !== 'undefined' && module && module.exports){
 
 下面是框架的一些简单的介绍
 
-####Django
+**Django**
 
 > [Django](http://www.phodal.com/blog/tag/django/) 是一个开放源代码的Web应用框架，由Python写成。采用了MVC的软件设计模式，即模型M，视图V和控制器C。它最初是被开发来用于管理劳伦斯出版集团旗下的一些以新闻内容为主的网站的。并于2005年7月在BSD许可证下发布。这套框架是以比利时的吉普赛爵士吉他手Django Reinhardt来命名的。
 
@@ -662,7 +1656,7 @@ if(typeof module !== 'undefined' && module && module.exports){
 
 最后一个才是亮点，内置GIS，虽然没怎么用到，但是至少在部署上还是比较方便的。
 
-###Haystack
+**Haystack**
 
 > Haystack provides modular search for Django. It features a unified, familiar API that allows you to plug in different search backends (such as Solr, Elasticsearch, Whoosh, Xapian, etc.) without having to modify your code.
 
@@ -672,7 +1666,7 @@ Haystack是为Django提供一个搜索模块blabla..，他的主要特性是可�
 
 也就是说你只需要写你的代码选择你的搜索引擎就可以工作了。
 
-###ElasticSearch
+**ElasticSearch**
 
 在上面的Haystack提供了这些一堆的搜索引擎，当然支持地点搜索的只有``Solr``和``ElasticSearch``，他们支持的空间搜索有:
 
@@ -686,51 +1680,40 @@ Haystack是为Django提供一个搜索模块blabla..，他的主要特性是可�
 
 至于为什么用的是ElasticSearch，是因为之前用Solr做过。。。
 
-###GIS架构说明 —— 客户端 
+#### 客户端 
 
-####简单说明  —— GET
+**简单说明  —— GET**
 
 1. 当我们访问Map View的时候，会调用HTML5获取用户的位置
 2. 根据用户的位置定位，设置缩放
 3. 根据用户的位置发出ElasticSearch请求，返回结果中带上距离
 4. 显示
 
-####简单说明  —— POST
+**简单说明  —— POST**
 
 1. 用户填写数据会发给Django API，并验证
 2. 成功时，存入数据库，更新索引。
 
-###Ionic
+**Ionic**
 
 > Ionic提供了一个免费且开源的移动优化HTML，CSS和JS组件库，来构建高交互性应用。基于Sass构建和AngularJS 优化。
 
 用到的主要是AngularJS，之前用他写过三个APP。
 
-###Django REST Framework
+**Django REST Framework**
 
 与Django Tastypie相比，DRF的主要优势在于Web界面的调试。
 
-##其他
+步骤
+---
 
-因为选的是比较熟悉的技术栈，所以也只花了不到两天的业余时间完成的。或许，这也是全栈程序员的优势所在。
-
-服务端代码: [https://github.com/phodal/django-elasticsearch](https://github.com/phodal/django-elasticsearch)
-
-客户端代码: [https://github.com/phodal/ionic-elasticsearch](https://github.com/phodal/ionic-elasticsearch)
-
-下一章: [GIS 移动应用实战 —— Django Haystack ElasticSearch 环境准备](http://www.phodal.com/blog/django-elasticsearch-haystack-prepare-enviorment/)
-
-  [1]: /static/media/uploads/elasticsearch_ionic_map.jpg
-  [2]: /static/media/uploads/elasticsearch_ionic_info_page.jpg
-  [3]: /static/media/uploads/struct.png
-  
-在一篇中，我们介绍了 [《Django ElasticSearch Ionic 打造 GIS 移动应用 —— 架构设计》](http://www.phodal.com/blog/django-elasticsearch-ionic-build-gis-application/)。接着，我们就开始实战了，内容也很简单。
-
-##Django GIS准备
+### Step 1: Django GIS 设置
 
 1.创建虚拟环境
 
-     virtualenv -p /usr/bin/python2.67 django-elasticsearch
+```bash
+virtualenv -p /usr/bin/python2.67 django-elasticsearch
+```
 
 2.创建项目
 
@@ -740,30 +1723,36 @@ Haystack是为Django提供一个搜索模块blabla..，他的主要特性是可�
 
 这里我的所有依赖有
 
-	django-haystack
-	Mezzanine==3.1.10
-	djangorestframework
-	pygeocoder
-	elasticsearch
+ - django-haystack
+ - Mezzanine==3.1.10
+ - djangorestframework
+ - pygeocoder
+ - elasticsearch
 
 安装
 
-    pip install requirements.txt
+```bash
+pip install requirements.txt
+```
 
 4.安装ElasticSearch
 
 CentOS
 
-    wget https://download.elasticsearch.org/elasticsearch/elasticsearch/elasticsearch-1.4.2.zip
-    sudo unzip elasticsearch-1.4.2 -d /usr/local/elasticsearch
-    rm elasticsearch-1.4.2.zip
-    cd /usr/local/elasticsearch/elasticsearch-1.4.2/
-    ./bin/plugin install elasticsearch/elasticsearch-cloud-aws/2.4.1
-    curl -XGET http://localhost:9200
+```bash
+wget https://download.elasticsearch.org/elasticsearch/elasticsearch/elasticsearch-1.4.2.zip
+sudo unzip elasticsearch-1.4.2 -d /usr/local/elasticsearch
+rm elasticsearch-1.4.2.zip
+cd /usr/local/elasticsearch/elasticsearch-1.4.2/
+./bin/plugin install elasticsearch/elasticsearch-cloud-aws/2.4.1
+curl -XGET http://localhost:9200
+```
 
 Mac OS
 
-    brew install elasticsearch
+```bash
+brew install elasticsearch
+```
 
 5.Django Geo环境搭建
 
@@ -771,49 +1760,46 @@ CentOS等GNU/Linux系统: 可以参照[CentOS Django Geo 环境搭建](http://ww
 
 MacOS: [Mac OS Django Geo 环境搭建](http://www.phodal.com/blog/django-elasticsearch-geo-solution/)
 
-##配置Django 
+### Step 2: 配置Haystack
 
-###配置Haystack
+**配置Haystack**
 
-    HAYSTACK_SIGNAL_PROCESSOR = 'haystack.signals.RealtimeSignalProcessor'
+```python
+HAYSTACK_SIGNAL_PROCESSOR = 'haystack.signals.RealtimeSignalProcessor'
 
-    HAYSTACK_CONNECTIONS = {
-        'default': {
-            'ENGINE': 'haystack.backends.elasticsearch_backend.ElasticsearchSearchEngine',
-            'URL': 'http://127.0.0.1:9200/',
-            'INDEX_NAME': 'haystack',
-        },
-    }   
+HAYSTACK_CONNECTIONS = {
+    'default': {
+        'ENGINE': 'haystack.backends.elasticsearch_backend.ElasticsearchSearchEngine',
+        'URL': 'http://127.0.0.1:9200/',
+        'INDEX_NAME': 'haystack',
+    },
+}   
+```
 
 ``HAYSTACK_SIGNAL_PROCESSOR``是为了可以实时处理。
 ``HAYSTACK_CONNECTIONS`` 则是配置搜索引擎用的。
 
-###配置Django
+**配置Django**
 
 在``settings.py``中的``INSTALLED_APPS``添加
 
-    "haystack",
-    "rest_framework",
-
+```python
+"haystack",
+"rest_framework",
+```
 
 接着
 
-     python manage.py createdb
-     python manage.py migreate
+```bash
+python manage.py createdb
+python manage.py migreate
+```
 
 运行
 
-     python manage.py runserver
-
-
-##其他: 
-
-
-服务端代码: [https://github.com/phodal/django-elasticsearch](https://github.com/phodal/django-elasticsearch)
-
-客户端代码: [https://github.com/phodal/ionic-elasticsearch](https://github.com/phodal/ionic-elasticsearch)
-
-上一篇中我们说到了[Django Haystack ElasticSearch 环境准备](http://www.phodal.com/blog/django-elasticsearch-haystack-prepare-enviorment/)，接着实战啦~~
+```bash
+python manage.py runserver
+```
 
 官方有一个简单的文档说明空间搜索—— [Spatial Search](http://django-haystack.readthedocs.org/en/latest/spatial.html)
 
@@ -821,112 +1807,111 @@ MacOS: [Mac OS Django Geo 环境搭建](http://www.phodal.com/blog/django-elasti
 
 创建Django app名为nx，目录结构如下
 
-    .
-    |______init__.py
-    |____api.py
-    |____models.py
-    |____search_indexes.py
-    |____templates
-    | |____search
-    | | |____indexes
-    | | | |____nx
-    | | | | |____note_text.txt
+```
+.
+|______init__.py
+|____api.py
+|____models.py
+|____search_indexes.py
+|____templates
+| |____search
+| | |____indexes
+| | | |____nx
+| | | | |____note_text.txt
+```
 
 api.py是后面要用的。
 
-###Django Haystack Model创建
+### Step 3: Django Haystack Model创建
 
 而一般的model没有什么区别，除了修改了save方法
 
-    from django.contrib import admin
+```python
+from django.contrib import admin
 
-    from django.contrib.gis.geos import Point
-    from django.core import validators
-    from django.utils.translation import ugettext_lazy as _
-    from django.db import models
-    from pygeocoder import Geocoder
+from django.contrib.gis.geos import Point
+from django.core import validators
+from django.utils.translation import ugettext_lazy as _
+from django.db import models
+from pygeocoder import Geocoder
 
-    class Note(models.Model):
-        title = models.CharField("标题", max_length=30, unique=True)
-        latitude = models.FloatField(blank=True)
-        longitude = models.FloatField(blank=True)
+class Note(models.Model):
+    title = models.CharField("标题", max_length=30, unique=True)
+    latitude = models.FloatField(blank=True)
+    longitude = models.FloatField(blank=True)
 
-        def __unicode__(self):
-            return self.title
+    def __unicode__(self):
+        return self.title
 
-        def save(self, *args, **kwargs):
-            results = Geocoder.geocode(self.province + self.city + self.address)
-            self.latitude = results[0].coordinates[0]
-            self.longitude = results[0].coordinates[1]
-            super(Note, self).save(*args, **kwargs)
+    def save(self, *args, **kwargs):
+        results = Geocoder.geocode(self.province + self.city + self.address)
+        self.latitude = results[0].coordinates[0]
+        self.longitude = results[0].coordinates[1]
+        super(Note, self).save(*args, **kwargs)
 
-        def get_location(self):
-            return Point(self.longitude, self.latitude)
+    def get_location(self):
+        return Point(self.longitude, self.latitude)
 
-        def get_location_info(self):
-            return self.province + self.city + self.address
+    def get_location_info(self):
+        return self.province + self.city + self.address
 
-    admin.site.register(Note)
+admin.site.register(Note)
+```
 
 通过``Geocoder.geocode`` 解析用户输入的地址，为了方便直接后台管理了。
 
-###创建search_index
+### Step 4: 创建search_index
 
 在源码的目录下有一个``search_indexes.py``的文件就是用于索引用的。
 
-    from haystack import indexes
-    from .models import Note
+```python
+from haystack import indexes
+from .models import Note
 
-    class NoteIndex(indexes.SearchIndex, indexes.Indexable):
-        text = indexes.CharField(document=True, use_template=True)
-        title = indexes.CharField(model_attr='title')
-        location = indexes.LocationField(model_attr='get_location')
-        location_info = indexes.CharField(model_attr='get_location_info')
+class NoteIndex(indexes.SearchIndex, indexes.Indexable):
+    text = indexes.CharField(document=True, use_template=True)
+    title = indexes.CharField(model_attr='title')
+    location = indexes.LocationField(model_attr='get_location')
+    location_info = indexes.CharField(model_attr='get_location_info')
 
-        def get_model(self):
-            return Note
+    def get_model(self):
+        return Note
+```
 
 与些同时我们还需要在``templates/search/indexes/nx/``目录中有``note_text.txt``里面的内容是:
 
-    {{ object.title }}
-    {{ object.get_location }}
-    {{ object.get_location_info }}
+```python
+{{ object.title }}
+{{ object.get_location }}
+{{ object.get_location_info }}
+```
 
-##创建数据
+**创建数据**
 
 migrate数据库
 
-    python manage.py migrate
+```bash
+python manage.py migrate
+```
 
 run
 
-    python manage.py runserver
+```bash
+python manage.py runserver
+```
 
 接着我们就可以后台创建数据了。 打开: http://127.0.0.1:8000/admin/nx/note/，把除了``Latitude``和``Longitude``以外的数据都一填——经纬度是自动生成的。就可以创建数据了。
 
-###测试
+**测试**
 
 访问 http://localhost:9200/haystack/_search
 
 或者
 
-    curl -XGET http://127.0.0.1:9200/haystack/_search
+```bash
+curl -XGET http://127.0.0.1:9200/haystack/_search
+```
 
-
-##其他: 
-
-
-服务端代码: [https://github.com/phodal/django-elasticsearch](https://github.com/phodal/django-elasticsearch)
-
-客户端代码: [https://github.com/phodal/ionic-elasticsearch](https://github.com/phodal/ionic-elasticsearch)
-
-在上一篇[《GIS 移动应用实战 —— Django Haystack ElasticSearch 构建》](http://www.phodal.com/blog/django-elasticsearch-ionic-build-gis-application-create-model/)中，我们构建了我们的服务端，可以通过搜索搜索到结果，这一篇，我们来构建一个简单的搜索。
-
-最后效果如下图所示:
-
-![Ionic ElasticSearch][1]
-
-##开始之前
 
 如果你没有Ionic的经验，可以参考一下之前的一些文章:[《HTML5打造原生应用——Ionic框架简介与Ionic Hello World》](http://www.phodal.com/blog/ionic-development-android-ios-windows-phone-application/)。
 
@@ -936,400 +1921,573 @@ run
 - ionic
 - ngCordova
 
-将他们添加到``bower.json``，然后
-    bower install
+将他们添加到``bower.json``，然后执行
 
-吧
+```bash
+bower install
+```
 
-##Ionic ElasticSearch 创建页面
+### Step 4: Ionic ElasticSearch 创建页面
 
 1.引入库
 
 在``index.html``中添加
 
-    <script src="lib/elasticsearch/elasticsearch.angular.min.js"></script>
-    <script src="lib/ngCordova/dist/ng-cordova.js"></script>
+```html
+<script src="lib/elasticsearch/elasticsearch.angular.min.js"></script>
+<script src="lib/ngCordova/dist/ng-cordova.js"></script>
+```
 
 接着开始写我们的搜索模板``tab-search.html``
 
 ```html
 <ion-view view-title="搜索" ng-controller="SearchCtrl">
-        <ion-content>
-            <div id="search-bar">
-                <div class="item item-input-inset">
-                    <label class="item-input-wrapper" id="search-input">
-                        <i class="icon ion-search placeholder-icon"></i>
-                        <input type="search" placeholder="Search" ng-model="query" ng-change="search(query)" autocorrect="off">
-                    </label>
-                </div>
+    <ion-content>
+        <div id="search-bar">
+            <div class="item item-input-inset">
+                <label class="item-input-wrapper" id="search-input">
+                    <i class="icon ion-search placeholder-icon"></i>
+                    <input type="search" placeholder="Search" ng-model="query" ng-change="search(query)" autocorrect="off">
+                </label>
             </div>
-        </ion-content>
-    </ion-view>
+        </div>
+    </ion-content>
+</ion-view>
 ```
 
 显示部分
 
 ```html
 <ion-list>
-                <ion-item class="item-remove-animate item-icon-right" ng-repeat="result in results">
-                    <h2 class="icon-left">{{result.title}}</h2>
-                    <p>简介: {{result.body}}</p>
-                    <div class="icon-left ion-ios-home location_info">
-                        {{result.location_info}}
-                    </div>
-                    <div class="button icon-left ion-ios-telephone button-calm button-outline">
-                        <a ng-href="tel: {{result.phone_number}}">{{result.phone_number}}</a>
-                    </div>
-                </ion-item>
-            </ion-list>
+    <ion-item class="item-remove-animate item-icon-right" ng-repeat="result in results">
+        <h2 class="icon-left">{{result.title}}</h2>
+        <p>简介: {{result.body}}</p>
+        <div class="icon-left ion-ios-home location_info">
+            {{result.location_info}}
+        </div>
+        <div class="button icon-left ion-ios-telephone button-calm button-outline">
+            <a ng-href="tel: {{result.phone_number}}">{{result.phone_number}}</a>
+        </div>
+    </ion-item>
+</ion-list>
 ```
 
 而我们期待的``SearchCtrl``则是这样的
 
-	$scope.query = "";
-	var doSearch = ionic.debounce(function(query) {
-		ESService.search(query, 0).then(function(results){
-			$scope.results = results;
-		});
-	}, 500);
+```javascript
+$scope.query = "";
+var doSearch = ionic.debounce(function(query) {
+	ESService.search(query, 0).then(function(results){
+		$scope.results = results;
+	});
+}, 500);
 
-	$scope.search = function(query) {
-		doSearch(query);
-	}
+$scope.search = function(query) {
+	doSearch(query);
+}
+```
 
 当我们点下搜索的时候，调用 ESService.
 
-##Ionic ElasticSearch Service
+### Step 5: Ionic ElasticSearch Service
 
 接着我们就来构建我们的ESService，下面的部分来自网上:
 
-    angular.module('starter.services', ['ngCordova', 'elasticsearch'])
+```javascript
+angular.module('starter.services', ['ngCordova', 'elasticsearch'])
 
-    .factory('ESService',
-      ['$q', 'esFactory', '$location', '$localstorage', function($q, elasticsearch, $location, $localstorage){
-        var client = elasticsearch({
-          host: $location.host() + ":9200"
-        });
+.factory('ESService',
+  ['$q', 'esFactory', '$location', '$localstorage', function($q, elasticsearch, $location, $localstorage){
+    var client = elasticsearch({
+      host: $location.host() + ":9200"
+    });
 
-        var search = function(term, offset){
-          var deferred = $q.defer(), query, sort;
-          if(!term){
-            query = {
-              "match_all": {}
-            };
-          } else {
-            query = {
-              match: { title: term }
-            }
-          }
-
-          var position = $localstorage.get('position');
-
-          if(position){
-            sort = [{
-              "_geo_distance": {
-                "location": position,
-                "unit": "km"
-              }
-            }];
-          } else {
-            sort = [];
-          }
-
-          client.search({
-            "index": 'haystack',
-            "body": {
-              "query": query,
-              "sort": sort
-            }
-          }).then(function(result) {
-            var ii = 0, hits_in, hits_out = [];
-            hits_in = (result.hits || {}).hits || [];
-            for(;ii < hits_in.length; ii++){
-              var data = hits_in[ii]._source;
-              var distance = {};
-              if(hits_in[ii].sort){
-                distance = {"distance": parseFloat(hits_in[ii].sort[0]).toFixed(1)}
-              }
-              angular.extend(data, distance);
-              hits_out.push(data);
-            }
-            deferred.resolve(hits_out);
-          }, deferred.reject);
-
-          return deferred.promise;
+    var search = function(term, offset){
+      var deferred = $q.defer(), query, sort;
+      if(!term){
+        query = {
+          "match_all": {}
         };
+      } else {
+        query = {
+          match: { title: term }
+        }
+      }
+
+      var position = $localstorage.get('position');
+
+      if(position){
+        sort = [{
+          "_geo_distance": {
+            "location": position,
+            "unit": "km"
+          }
+        }];
+      } else {
+        sort = [];
+      }
+
+      client.search({
+        "index": 'haystack',
+        "body": {
+          "query": query,
+          "sort": sort
+        }
+      }).then(function(result) {
+        var ii = 0, hits_in, hits_out = [];
+        hits_in = (result.hits || {}).hits || [];
+        for(;ii < hits_in.length; ii++){
+          var data = hits_in[ii]._source;
+          var distance = {};
+          if(hits_in[ii].sort){
+            distance = {"distance": parseFloat(hits_in[ii].sort[0]).toFixed(1)}
+          }
+          angular.extend(data, distance);
+          hits_out.push(data);
+        }
+        deferred.resolve(hits_out);
+      }, deferred.reject);
+
+      return deferred.promise;
+    };
 
 
-        return {
-          "search": search
-        };
-      }]
-    );
+    return {
+      "search": search
+    };
+  }]
+);
+```
 
 这个Service主要做的是创建ElasitcSearch Query，然后返回解析结果。
 
-##运行
 
-如果是要在真机上运行，需要处于同一网段，或者是部署到服务器上。
-
-##其他: 
-
-
-服务端代码: [https://github.com/phodal/django-elasticsearch](https://github.com/phodal/django-elasticsearch)
-
-客户端代码: [https://github.com/phodal/ionic-elasticsearch](https://github.com/phodal/ionic-elasticsearch)
-
-
-  [1]: /static/media/uploads/ionic_elasticsearch_search_view.jpg
-
-在上一篇[《地图移动应用实战:Ionic ElasticSearch 搜索服务》](http://www.phodal.com/blog/ionic-searchview-django-elasticsearch-ionic-build-gis-application/)中我们说到了，如果创建一个搜索服务，以及使用搜索接口。接着，我们来将他们显示到地图上。
-
-效果图:
-
-![Ionic ElasticSearch Map Show][1]
-
-##设计思路
+**设计思路**
 
 1. 判断是否有上次记录的位置信息，如果有则将地图的中心设置为上次的位置。
-
 2. 将位置添加到ElasticSearch的Query中。
-
 3. 从ElasticSearch中获取数据，并解析Render到地图上。
 
-
-##OpenLayer
+**OpenLayer**
 
 > OpenLayers是一个用于开发WebGIS客户端的JavaScript包。OpenLayers 支持的地图来源包括Google Maps、Yahoo、 Map、微软Virtual Earth 等，用户还可以用简单的图片地图作为背景图，与其他的图层在OpenLayers 中进行叠加，在这一方面OpenLayers提供了非常多的选择。除此之外，OpenLayers实现访问地理空间数据的方法都符合行业标准。OpenLayers 支持Open GIS 协会制定的WMS（Web Mapping Service）和WFS（Web Feature Service）等网络服务规范，可以通过远程服务的方式，将以OGC 服务形式发布的地图数据加载到基于浏览器的OpenLayers 客户端中进行显示。OpenLayers采用面向对象方式开发，并使用来自Prototype.js和Rico中的一些组件。
 
-###添加OpenLayer 3
+### Step 6: Ionic OpenLayer 地图显示
 
 1.下载OpenLayer
 
 2.添加到``index.html``:
 
-    <script src="js/ol.js"></script>
+```html
+<script src="js/ol.js"></script>
+```
 
-##Ionic OpenLayer 地图显示:
-
-###创建NSService
+**创建NSService**
 
 新建一个``MapCtrl``，需要用到``ESService``和 ``NSService``，NSService是官方示例中的一个函数，提供了一个``getRendererFromQueryString``方法。
 
-    .factory('NSService', function(){
-          var exampleNS = {};
+```javascript
+.factory('NSService', function(){
+      var exampleNS = {};
 
-          exampleNS.getRendererFromQueryString = function() {
-            var obj = {}, queryString = location.search.slice(1),
-                re = /([^&=]+)=([^&]*)/g, m;
+      exampleNS.getRendererFromQueryString = function() {
+        var obj = {}, queryString = location.search.slice(1),
+            re = /([^&=]+)=([^&]*)/g, m;
 
-            while (m = re.exec(queryString)) {
-              obj[decodeURIComponent(m[1])] = decodeURIComponent(m[2]);
-            }
-            if ('renderers' in obj) {
-              return obj['renderers'].split(',');
-            } else if ('renderer' in obj) {
-              return [obj['renderer']];
-            } else {
-              return undefined;
-            }
-          };
+        while (m = re.exec(queryString)) {
+          obj[decodeURIComponent(m[1])] = decodeURIComponent(m[2]);
+        }
+        if ('renderers' in obj) {
+          return obj['renderers'].split(',');
+        } else if ('renderer' in obj) {
+          return [obj['renderer']];
+        } else {
+          return undefined;
+        }
+      };
 
-          return {
-            "exampleNS": exampleNS
-          };
-    })
+      return {
+        "exampleNS": exampleNS
+      };
+})
+```
 
-###创建基本地图显示
+**创建基本地图显示**
 
 这里我们使用的是Bing地图:
 
-      var view = new ol.View({
-		center: map_center,
-		zoom: 4
-	});
+```javascirpt
+var view = new ol.View({
+	center: map_center,
+	zoom: 4
+});
 
-	var controls = ol.control.defaults({rotate: false});
-	var interactions = ol.interaction.defaults({altShiftDragRotate:false, pinchRotate:false});
+var controls = ol.control.defaults({rotate: false});
+var interactions = ol.interaction.defaults({altShiftDragRotate:false, pinchRotate:false});
 
-	var map = new ol.Map({
-		controls: controls,
-		interactions: interactions,
-		layers: [
-			new ol.layer.Tile({
-				source: new ol.source.BingMaps({
-					key: 'Ak-dzM4wZjSqTlzveKz5u0d4IQ4bRzVI309GxmkgSVr1ewS6iPSrOvOKhA-CJlm3',
-					culture: 'zh-CN',
-					imagerySet: 'Road'
-				})
+var map = new ol.Map({
+	controls: controls,
+	interactions: interactions,
+	layers: [
+		new ol.layer.Tile({
+			source: new ol.source.BingMaps({
+				key: 'Ak-dzM4wZjSqTlzveKz5u0d4IQ4bRzVI309GxmkgSVr1ewS6iPSrOvOKhA-CJlm3',
+				culture: 'zh-CN',
+				imagerySet: 'Road'
 			})
-		],
-		renderer: NSService.exampleNS.getRendererFromQueryString(),
-		target: 'map',
-		view: view
-	});
+		})
+	],
+	renderer: NSService.exampleNS.getRendererFromQueryString(),
+	target: 'map',
+	view: view
+});
+```
 
 一个简单的地图如上如示。
 
-###获取当前位置
+**获取当前位置**
 
 ngCordova有一个插件是``$cordovaGeolocation``，用于获取当前的位置。代码如下所示:
 
-	var posOptions = {timeout: 10000, enableHighAccuracy: true};
-	$cordovaGeolocation
-		.getCurrentPosition(posOptions)
-		.then(function (position) {
-			var pos = new ol.proj.transform([position.coords.longitude, position.coords.latitude], 'EPSG:4326', 'EPSG:3857');
+```javascript
+var posOptions = {timeout: 10000, enableHighAccuracy: true};
+$cordovaGeolocation
+	.getCurrentPosition(posOptions)
+	.then(function (position) {
+		var pos = new ol.proj.transform([position.coords.longitude, position.coords.latitude], 'EPSG:4326', 'EPSG:3857');
 
-			$localstorage.set('position', [position.coords.latitude, position.coords.longitude].toString());
-			$localstorage.set('map_center', pos);
+		$localstorage.set('position', [position.coords.latitude, position.coords.longitude].toString());
+		$localstorage.set('map_center', pos);
 
-			view.setCenter(pos);
-		}, function (err) {
-			console.log(err)
-		});
-
+		view.setCenter(pos);
+	}, function (err) {
+		console.log(err)
+	});
+```
 
 当获取到位置时，将位置存储到``localstorage``中。
 
-###获取结果并显示
+**获取结果并显示**
 
 最后代码如下所示，获取解析后的结果，添加icon
 
-	ESService.search("", 0).then(function(results){
-		var vectorSource = new ol.source.Vector({ });
-		$.each(results, function(index, result){
-			var position = result.location.split(",");
-			var pos = ol.proj.transform([parseFloat(position[1]), parseFloat(position[0])], 'EPSG:4326', 'EPSG:3857');
+```javascript
+ESService.search("", 0).then(function(results){
+	var vectorSource = new ol.source.Vector({ });
+	$.each(results, function(index, result){
+		var position = result.location.split(",");
+		var pos = ol.proj.transform([parseFloat(position[1]), parseFloat(position[0])], 'EPSG:4326', 'EPSG:3857');
 
-			var iconFeature = new ol.Feature({
-					geometry: new ol.geom.Point(pos),
-					name: result.title,
-					phone: result.phone_number,
-					distance: result.distance
-			});
-			vectorSource.addFeature(iconFeature);
+		var iconFeature = new ol.Feature({
+				geometry: new ol.geom.Point(pos),
+				name: result.title,
+				phone: result.phone_number,
+				distance: result.distance
 		});
-
-		var iconStyle = new ol.style.Style({
-			image: new ol.style.Icon(({
-				anchor: [0.5, 46],
-				anchorXUnits: 'fraction',
-				anchorYUnits: 'pixels',
-				opacity: 0.75,
-				src: 'img/icon.png'
-			}))
-		});
-
-		var vectorLayer = new ol.layer.Vector({
-			source: vectorSource,
-			style: iconStyle
-		});
-		map.addLayer(vectorLayer);
+		vectorSource.addFeature(iconFeature);
 	});
 
-###添加点击事件
+	var iconStyle = new ol.style.Style({
+		image: new ol.style.Icon(({
+			anchor: [0.5, 46],
+			anchorXUnits: 'fraction',
+			anchorYUnits: 'pixels',
+			opacity: 0.75,
+			src: 'img/icon.png'
+		}))
+	});
+
+	var vectorLayer = new ol.layer.Vector({
+		source: vectorSource,
+		style: iconStyle
+	});
+	map.addLayer(vectorLayer);
+});
+```
+
+**添加点击事件**
 
 在上面的代码中添加:
 
-		var element = document.getElementById('popup');
+```javascript
+var element = document.getElementById('popup');
 
-		var popup = new ol.Overlay({
-			element: element,
-			positioning: 'bottom-center',
-			stopEvent: false
+var popup = new ol.Overlay({
+	element: element,
+	positioning: 'bottom-center',
+	stopEvent: false
+});
+map.addOverlay(popup);
+
+map.on('click', function(evt) {
+	var feature = map.forEachFeatureAtPixel(evt.pixel,
+		function(feature, layer) {
+			return feature;
 		});
-		map.addOverlay(popup);
 
-		map.on('click', function(evt) {
-			var feature = map.forEachFeatureAtPixel(evt.pixel,
-				function(feature, layer) {
-					return feature;
-				});
-
-			if (feature) {
-				var geometry = feature.getGeometry();
-				var coord = geometry.getCoordinates();
-				popup.setPosition(coord);
-				$(element).popover({
-					'placement': 'top',
-					'html': true,
-					'content': "<h4>商品:" + feature.get('name') + "</h4>" + '' +
-					'<div class="button icon-left ion-ios-telephone button-calm button-outline">' +
-					'<a ng-href="tel: {{result.phone_number}}">' + feature.get('phone') + '</a> </div>' +
-						"<p class='icon-left ion-ios-navigate'> " + feature.get('distance') + "公里</p>"
-				});
-				$(element).popover('show');
-			} else {
-				$(element).popover('destroy');
-			}
+	if (feature) {
+		var geometry = feature.getGeometry();
+		var coord = geometry.getCoordinates();
+		popup.setPosition(coord);
+		$(element).popover({
+			'placement': 'top',
+			'html': true,
+			'content': "<h4>商品:" + feature.get('name') + "</h4>" + '' +
+			'<div class="button icon-left ion-ios-telephone button-calm button-outline">' +
+			'<a ng-href="tel: {{result.phone_number}}">' + feature.get('phone') + '</a> </div>' +
+				"<p class='icon-left ion-ios-navigate'> " + feature.get('distance') + "公里</p>"
 		});
+		$(element).popover('show');
+	} else {
+		$(element).popover('destroy');
+	}
+});
+```
 
 当用户点击时，调用Bootstrap的Popover来显示信息。
 
+![ElasticSearch Map](./images/elasticsearch_ionit_map.jpg)
+    
 
-##其他: 
+一步步搭建JavaScript框架: Lettuce
+===
 
+概况
+---
 
-服务端代码: [https://github.com/phodal/django-elasticsearch](https://github.com/phodal/django-elasticsearch)
+### 背景
 
-客户端代码: [https://github.com/phodal/ionic-elasticsearch](https://github.com/phodal/ionic-elasticsearch)
+从开始打算写一个MV*，到一个简单的demo，花了几天的时间，虽然很多代码都是复制/改造过来的，然而**It Works**(nginx的那句话会让人激动有木有)。现在他叫lettuce，代码 [https://github.com/phodal/lettuce](https://github.com/phodal/lettuce)，如果有兴趣可以加入我们。
 
+虽然js还不够expert，但是开始了。
 
-  [1]: /static/media/uploads/elasticsearch_ionit_map.jpg    
+步骤
+---
 
-在设计 lan (Github: [https://github.com/phodal/lan](https://github.com/phodal/lan)) 物联网平台的时候，结合之前的一些经验，构建出一个实际应用中的物联网构架模型。
+###Step 1: 注册npm和bower包
 
-然后像[lan](https://github.com/phodal/lan)这样的应用，在里面刚属于服务层。
+一开始我做的3次commits是:
 
-##物联网层级结构
+    * e4e6e04 - Add README.md (3 weeks ago) <Fengda HUANG>
+    * 37411d7 - publish bower (3 weeks ago) <Fengda HUANG>
+    * aabf278 - init project (3 weeks ago) <Fengda HUANG>
 
-通常，我们很容易在网上看到如下图所示的三层结构:
+是的一开始什么也没做，除了从``bower``和``npm``上注册了一个叫做``lettuce``的库:
 
-![物联网三层结构][1]
+```javascript
+{
+  "name": "lettuce",
+  "version": "0.0.2",
+  "authors": [
+    "Fengda HUANG <h@phodal.com>"
+  ],
+  "description": "A Mobile JavaScript Framework",
+  "main": "index.js",
+  "moduleType": [
+    "amd",
+    "node"
+  ],
+  "keywords": [
+    "lettuce",
+    "mobile"
+  ],
+  "license": "MIT",
+  "homepage": "http://lettuce.phodal.com",
+  "private": false,
+  "ignore": [
+    "**/.*",
+    "node_modules",
+    "bower_components",
+    "test",
+    "tests"
+  ]
+}
+```
 
-从理论上划分这样的层级结构是没有问题的，也是有各种理论依据。然而理论和现实往往是严重脱轨的，如上图所示，图中将网络层单独分为了一层，而并没有独立出应用程序相关的功能。
+然后在我们还没有开始写代码的时候版本就已经是``0.0.2``这个速度好快。。总结如下:
 
-从实践的角度上，我更愿意用如下的架构来构建我的物联网系统。
+ - 取一个好的名字
+ - 在npm和bower上挖一个坑给自己
+ - 开始写README.md
 
-![物联网层级结构][2]
+所以我的``README.md``是这样子的
 
-其功能可以用下表来表示。
+```
+#Lettuce
 
-层级|作用|与下一层级的连接方式 
----|----------|------------------
-硬件层|获取、发送传感器数据，执行指令|串口、蓝牙、有线、SPI、WiFi、USB等等
-协调层|协调硬件层与服务器的通信，并负责处理部分数据|网络连接及硬件层的连接方式
-服务层|以视为服务器层|网络连接
-应用程序层|为用户提供交互功能|网络连接
+> A is Mobile JavaScript Framework
 
-硬件层包含了数据众多的传感器、控制器、以及执行器，通常这部份会由硬件人员与硬件开发人员一起协作和开发。而协调层则是充当硬件与服务层通信的桥梁，这是在系统中需要**特别考虑**的部份，一个物联网系统的设计主要**取决于这个层级**。
+Coming soon
+```
 
-##物联网服务层
+是的，我们的代码已经``Coming soon``了。
 
-而服务层的核心是传统的Web应用程序的结构，只是协议层变成了一些适配器，我们需要支持不同的协议，这导致了我们在这个层需要有一个更好的结构，故而我们建议使用**六边形架构**。而在实际中，用户最后接触到的便是应用程序层，在这一层中需要有很好的用户体验设计及流畅度。
+### Step 2: 生成Javascript项目框架
 
-因而在设计[Lan](https://github.com/phodal/lan)物联网平台的时候，参考了之前的[物联网平台](https://github.com/phodal/diaonan)的设计，增加了用户授权以及模块化加载思想。
+为了简化这一个痛苦的过程，我们还是用yeoman。
 
-![IoT Server Layer][3]
+#### 安装Yeoman lib生成器
 
-上图的模型可以让我们脱离具体的框架与实现，关注于业务上逻辑。
+1.安装yeoman
 
-  [1]: /static/media/uploads/iot-3-layer.jpg
-  [2]: /static/media/uploads/iot-layer.jpg
-  [3]: /static/media/uploads/iot-server.jpg
-  
-  
+```bash
+npm install -g yo
+```
 
-> 尽管是在年末，并且也还没把书翻译完，也还没写完书的第一稿。但是，我还是觉得这是一个非常不错的话题——测试代码生成。
+2.安装generator-lib
+
+```bash
+npm install -g generator-lib
+```
+
+3.创建项目
+
+```bash 
+mkdir ~/lettuce && cd $_
+yo lib
+```
+
+接着我们就迎来了
+
+```
+     _-----_
+    |       |
+    |--(o)--|   .--------------------------.
+   `---------´  |    Welcome to Yeoman,    |
+    ( _´U`_ )   |   ladies and gentlemen!  |
+    /___A___\   '__________________________'
+     |  ~  |
+   __'.___.'__
+ ´   `  |° ´ Y `
+
+[?] What do you want to call your lib? Lettuce
+[?] Describe your lib: A Framework for Romantic
+[?] What is your GitHub username? phodal
+[?] What is your full name? Fengda Huang
+[?] What year for the copyright? 2015
+```
+
+省略上百字，你的目录里就会有
+
+```
+.
+|____.editorconfig
+|____.gitattributes
+|____.gitignore
+|____.jshintrc
+|____bower.json
+|____demo
+| |____assets
+| | |____main.css
+| | |____normalize.css
+| |____index.html
+|____dist
+| |____Lettuce.js
+| |____Lettuce.min.js
+|____docs
+| |____MAIN.md
+|____Gruntfile.js
+|____index.html
+|____LICENSE.txt
+|____package.json
+|____README.md
+|____src
+| |_____intro.js
+| |_____outro.js
+| |____main.js
+|____test
+| |____all.html
+| |____all.js
+| |____lib
+| | |____qunit.css
+| | |____qunit.js
+```
+
+这么多的文件。
+
+#### Build JavaScript项目
+
+于是我们执行了一下
+
+    grunt
+
+就有了这么多的log:
+
+```
+Running "concat:dist" (concat) task
+File "dist/Lettuce.js" created.
+
+Running "jshint:files" (jshint) task
+>> 1 file lint free.
+
+Running "qunit:files" (qunit) task
+Testing test/all.html .OK
+>> 1 assertions passed (20ms)
+
+Running "uglify:dist" (uglify) task
+File "dist/Lettuce.min.js" created.
+
+Done, without errors.
+```
+
+看看我们的Lettuce.js里面有什么
+
+```
+(function(root, undefined) {
+  "use strict";
+/* Lettuce main */
+// Base function.
+var Lettuce = function() {
+  // Add functionality here.
+  return true;
+};
+// Version.
+Lettuce.VERSION = '0.0.1';
+// Export to the root, which is probably `window`.
+root.Lettuce = Lettuce;
+}(this));
+```
+
+我们的库写在[立即执行函数表达式](https://www.phodal.com/blog/javascript-immediately-invoked-function-expression)里面。这样便是和jQuery等库一样了。
+
+grunt里的任务包含了:
+
+ - jshint 代码检查
+ - contact 合并js到一个文件
+ - minify js 压缩js
+ - qunit 单元测试
+
+这样我们就可以轻松上路了。
+
+### Step 3: 寻找所需要的函数
+
+### Step 4: 整合
+
+### Step 5: 测试
+
+### 练习建议
+
+基于Virtual DOM的测试代码生成
+===
+
+概况
+---
+
+### 背景
 
 当我们在写一些UI测试的时候，我们总需要到浏览器去看一下一些DOM的变化。比如，我们点击了某个下拉菜单，会有另外一个联动的下拉菜单发生了变化。而如果这个事件更复杂的时候，有时我们可能就很难观察出来他们之间的变化。
 
-##Virtual DOM
+### ShowCase
+
+![Luffa Screenshot](./images/luffa.jpg)
+
+源码见：[https://github.com/phodal/luffa](https://github.com/phodal/luffa)
+
+### 基本原理
 
 尽管这里的例子是以Jasmine作为例子，但是我想对于React也会有同样的方法。
 
-###一个Jasmine jQuery测试
+**一个Jasmine jQuery测试**
 
 如下是一个简单的Jamine jQuery的测试示例：
 
@@ -1351,7 +2509,10 @@ ngCordova有一个插件是``$cordovaGeolocation``，用于获取当前的位置
 
 那么，即使我们已经有一个固定的DOM，想要监听这个DOM的变化就是一件容易的事。在我们断言之前，我们就会有一个新的DOM。我们只需要Diff一下这两个DOM的变化，就可以生成这部分测试代码。
 
-###virtual-dom与HyperScript
+步骤
+---
+
+###Step 1: Virtual-dom与HyperScript
 
 在寻觅中发现了[virtual-dom](https://github.com/Matt-Esch/virtual-dom)这个库，一个可以支持创建元素、diff计算以及patch操作的库，并且它效率好像还不错。
 
@@ -1445,7 +2606,7 @@ virtualDom.diff(render(2), render(1))
 
 第一个对象，即0中包含了一些属性的变化。而第二个则是文本的变化——从2变成了1。我们所要做的测试生成便是标记这些变化，并记录之。
 
-##标记DOM变化
+### Step 2: 标记DOM变化
 
 由于virtual-dom依赖于虚拟节点vNode，我们需要将fixtures转换为hyperscript。这里我们就需要一个名为html2hyperscript的插件，来解析html。接着，我们就可以diff转换完后的DOM：
 
@@ -1516,15 +2677,25 @@ function printNode(applyNode, originRootNodeHTML, patchIndex) {
 
 最后，我们似乎就可以生成相应的测试代码了。。。
 
-###其他
+单页面移动应用
+===
 
-源码见：[https://github.com/phodal/luffa](https://github.com/phodal/luffa)
+概况
+---
+
+### 背景
 
 看到项目上的移动框架，网上寻找了一下，发现原来这些一开始都有。于是，找了个示例开始构建一个移动平台的CMS——[墨颀 CMS](http://cms.moqi.mobi)，方便项目深入理解的同时，也可以自己维护一个CMS系统。
 
-##构建框架
+### Showcase
 
-尝试过用AngularJS和EmberJS，发现对于使用AngluarJS以及EmberJS来说，主要的问题是要使用自己熟悉的东西没那么容易引入。而且考虑到谷歌向来对自己的项目的支持不是很好~~，所以便放弃了AngluarJS的想法。
+GitHub: [http://github.com/phodal/moqi.mobi](http://github.com/phodal/moqi.mobi)
+
+Demo: [墨颀 CMS](http://cms.moqi.mobi)
+
+### jQuery + Backbone + UnderScore + Require.JS
+
+尝试过用AngularJS和EmberJS，发现对于使用AngularJS以及EmberJS来说，主要的问题是要使用自己熟悉的东西没那么容易引入。而且考虑到谷歌向来对自己的项目的支持不是很好~~，所以便放弃了AngluarJS的想法。
 
 于是开始寻找一些方案，但是最后还是选择了一个比较通用的方案。
 
@@ -1535,7 +2706,7 @@ function printNode(applyNode, originRootNodeHTML, patchIndex) {
 
 相对于AngularJS来说，Backbone是一个轻量级的方案，从大小上来说。对于自己来说，灵活性算是其中好的一点，也就是自己可以随意的加入很多东西。
 
-###关于Backbone
+**关于Backbone**
 
 > Backbone.js是一套JavaScript框架与RESTful JSON的应用程式接口。也是一套大致上符合MVC架构的编程范型。Backbone.js以轻量为特色，只需依赖一套Javascript 函式库即可运行。
 
@@ -1548,57 +2719,38 @@ function printNode(applyNode, originRootNodeHTML, patchIndex) {
 
 前台UI，使用的是Pure CSS，一个轻量级的CSS框架，但是最后感觉，总体用到一起，大小还是相当的。只是可以有一个更好的移动体验。
 
-###其他可替换的框架
+****其他可替换的框架**
 
 **AngularJS**，考虑到某些因素，可能会替换掉Backbone，但是还不是当前可行的方案。为了学习是一方案，也为了更好的普及某些东西。
 
 **handlebars**  Handlebars 是Mustache的改进，显示与逻辑分离，语法兼容Mustache，可以编译成代码，改进Mustache对路径的支持，但是若需要在服务端运行需要使用服务端Javascript引擎如Node.js。
 
-##项目
+**项目**
 
 前后端分离设计，后台对前台只提供JSON数据，所以在某种意义上来说可能会只适合浏览，和这个要配合后台的框架。总的来说，适合于阅读类的网站。
 
-###源码
+**源码**
 
 代码依然是放在Github上，基本功能已经可以Works了。
 
 [https://github.com/gmszone/moqi.mobi](https://github.com/gmszone/moqi.mobi)
 
-###进展及目的
+步骤
+---
 
-最后目标:构建一个移动平台的CMS系统。
+### Step 1: 使用Require.js管理依赖
 
-当前:对于这样一个项目来说，目前会考虑优先支持下面的两个框架，
-
- - Django+Tastypie API
- - Wordpress
-
-现在：可以从后台读取到数据。
-
-##其他
-一些比较好的资料有
-
-- [Organizing your application using Modules](http://backbonetutorials.com/organizing-backbone-using-modules/)
- - [Converting an existing Backbone.js project to Require.js](http://ozkatz.github.io/converting-an-existing-backbonejs-project-to-requirejs.html)
-
-
-在一篇[构建基于Javascript的移动web CMS入门——简介](http://www.phodal.com/blog/use-jquery-backbone-mustache-build-mobile-app-cms/)中简单的介绍了关于[墨颀CMS](http://cms.moqi.mobi)的一些原理，其极框架组成，于是开始接着应该说明一下这个CMS是如何一步步搭建起来。
-
-##RequireJS 使用
-
-###库及依赖
+**库及依赖**
 
 这里用的是bower的JS来下载库，详细可以参考一下[bower install js使用bower管理js](http://www.phodal.com/blog/use-bower-to-install-js-plugins/) 这篇文章。
 
 需要下载的库有
 
- -  RequireJS
+ - RequireJS
  - Backbone
  - Underscore
  - Mustache
  - jQuery
-
-###使用RequireJS
 
 引用官网的示例
 
@@ -1645,46 +2797,7 @@ function printNode(applyNode, originRootNodeHTML, patchIndex) {
 	    };
 	});
 
-当打开index.html的时候便会在console中输出``Hello World``。这样我们就完成一个基本的框架，只是还没有HTML，这个将会在下次继续。
-
-在上一篇[《构建基于Javascript的移动CMS——Hello,World》](www.phodal.com/blog/use-jquery-backbone-mustache-build-mobile-app-cms/)讲述了[墨颀 CMS](http://cms.moqi.mobi/)的大概组成，并进行了一个简单的示例，即Hello,World。这一次，我们将把CMS简单的放到一个可以运行的服务器环境中，也就是说我们需要一个简单的运行环境，以便于进行更有意思的东西——添加模板。
-
-##开始之前
-
-###环境准备
-
-####类Unix系统
-因为电脑上已经装有python了，这里便用python起一个简单的server，对于GNU/Linux、Mac OS等类unix系统来说，都可以这样运行:
-
-    python -m SimpleHTTPServer 8000
-   
-####Windows    
-对于Windows来说，如果你已经装有python的话，那自然是可以用上面的方式运行。如果没有的话，可以试一下``mongoose``，下载一个安装之。
-
-###JS库准备
-
-需要准备的JS库有
-
- - Backbone
- - RequireJs的插件text.js
- - Mustache
-
-###只想要这次的代码
-
-那么就这样子吧
-
-     git@github.com:gmszone/moqi.mobi.git
-     
-接着切换到learing分支
-
-     git checkout learning     
-     
-checkout到这个版本
-
-    git checkout 62fbdaf
-    
-##构建移动web CMS
-
+当打开index.html的时候便会在console中输出``Hello World``。这样我们就完成一个基本的框架，只是还没有HTML，
 文件列表如下所示
 
 	.
@@ -1702,7 +2815,7 @@ checkout到这个版本
 	
 在这里有些混乱，但是为了少去其中的一些配置的麻烦，就先这样讲述。
 
-###添加路由
+### Step 2: 添加路由
 
 用Backbone的一个目的就在于其的路由功能，于是便添加这样一个js——``router.js``,内容如下所示:
 
@@ -1753,7 +2866,7 @@ checkout到这个版本
 	
 也就是初始化一下路由。
 
-###创建主页View
+### Step 3: 创建主页View
 
 使用Mustache的优点在于，后台仅仅只需要提供数据，并在前台提供一个位置。因此我们修改了下HTML
 
@@ -1799,7 +2912,7 @@ checkout到这个版本
 
 当看到[墨颀 CMS](http://cms.moqi.mobi/)的菜单，变成一个工具栏的时候，变觉得这一切有了意义。于是就继续看看这样一个CMS的边栏是怎么组成的。
 
-##RequireJS与jQuery 插件示例
+**RequireJS与jQuery 插件示例**
 
 一个简单的组合示例如下所示，在main.js中添加下面的内容
 
@@ -1818,9 +2931,7 @@ checkout到这个版本
 
 这样我们就可以完成一个简单的插件的添加。
 
-##[墨颀CMS](http://cms.moqi.mobi)添加jQuery插件
-
-###jQuery Sidr
+### Step 4: jQuery Sidr
 
 > The best jQuery plugin for creating side menus and the easiest way for doing your menu responsive
 
@@ -1852,8 +2963,6 @@ checkout到这个版本
 	});
 
 添加jquery.sidr.min到里面。
-
-###jQuery Sidr与RequireJS协作
 
 引用官方的示例代码
 
@@ -1888,9 +2997,7 @@ checkout到这个版本
 
 正在一步步完善[墨颀 CMS](http://cms.moqi.mobi/)，在暂时不考虑其他新的功能的时候，先和[自己的博客](http://www.phodal.com)整合一下。
 
-##Django Tastypie 跨域
-
-###Django Tastypie示例
+### Step 5: Django Tastypie示例
 
 之前用AngluarJS做的全部文章的时候是Tastypie做的API，只是用来生成的是博客的内容。只是打开的速度好快，可以在1秒内打开，献上URL:
 
@@ -1940,7 +3047,7 @@ checkout到这个版本
 	  ]
 	}
 
-###Django Tastypie 跨域支持
+#### 跨域支持
 
 于是网上搜索了一下，有了下面的代码:
 
@@ -2007,7 +3114,7 @@ checkout到这个版本
 
 接着便可以很愉快地、危险地跨域。
 
-##Django 与墨颀CMS整合
+#### 整合
 
 接着修改了一下代码中configure.json的blogListUrl，以及模块
 
@@ -2025,9 +3132,7 @@ checkout到这个版本
 
 一开始对于可配置的选择是正确的.
 
-在上一篇中说到了如何创建一个[Django Tastypie API](http://www.phodal.com/blog/use-jquery-backbone-mustache-build-mobile-app-cms-work-with-django/)给[移动CMS](http://cms.moqi.mobi)用，接着我们似乎也应该有一个本地的配置文件用于一些简单的配置，如"获取API的URL"、"产品列表"、"SEO"(在一开始的时候发现这是不好的，后面又发现Google的爬虫可以运行Javascript，不过也是不推荐的。)这些东西是不太需要修改的，直接写在代码中似乎又不好，于是放到了一个叫作``configure.json``的文件里。
-
-##RequireJS Plugins
+### Step 6: RequireJS Plugins
 
 网上搜索到一个叫RequireJS Plugins的repo。
 
@@ -2048,9 +3153,6 @@ checkout到这个版本
 于是，我们可以用到这里的json用来加载JSON文件，虽然也可以用Requirejs的text插件，但是这里的json有对此稍稍的优化。
 
 在后面的部分中我们也用到了mdown，用于显示一个md文件，用法上大致是一样的。
-
-##RequireJS JSON文件加载
-
 
 将json.js插件放到目录里，再配置好main.js。
 
@@ -2106,7 +3208,7 @@ checkout到这个版本
 在[墨颀 CMS](http://cms.moqi.mobi)中的动态的文章是从我博客的API加载过来的，因为当前没有其他好的CMS当接口。之前直接拿博客的DB文件+Nodejs+RESTify生成了一个博客的API，而且可以支持跨域请求。
 
 
-##简单的博客构成
+### Step 6: 简单的博客
 
 这次我们可以简单的做一个可以供移动平台阅读的博客，除了不能写作以外(ps:不能写作还能叫博客么)。对于写博客的人来说更多的只是写，而对于读者来说，他们只需要读，所以在某种意义上可以将博客的写和读分离开来。
 
@@ -2117,7 +3219,7 @@ checkout到这个版本
 
 在这里我们先关注博文列表 
  
-###博文列表
+**博文列表**
 
 博文列表的内容一般有:
 
@@ -2146,7 +3248,7 @@ checkout到这个版本
 这里基本上也就有了上面的要素，除了作者，当然因为作者只有一个，所以在里面写作者就是在浪费流量和钱啊。接着我们就是要把上面的内容读取出来放到CMS里。和之前不同的是，虽然我们可以用和[墨颀CMS文件 JSON文件](http://www.phodal.com/blog/use-jquery-backbone-mustache-build-mobile-app-cms-json-configure/)一样的方法，但是显然这种方法很快就会不适用。
 
 
-##移动CMS 获取在线数据
+#### 获取在线数据
 
 这里会用到Backbone的Model，我们先创建一个Model
 
@@ -2239,10 +3341,7 @@ checkout到这个版本
 
 下一次我们将打开这些URL。    
 
-
-###其他
-
-####如何查看是否支持JSON跨域请求
+#### 如何查看是否支持JSON跨域请求
 
 本次代码下载:[https://github.com/gmszone/moqi.mobi/archive/0.1.1.zip](https://github.com/gmszone/moqi.mobi/archive/0.1.1.zip)
 
@@ -2270,7 +3369,7 @@ checkout到这个版本
     
 在有了上部分的基础之后，我们就可以生成一个博客的内容——BlogPosts Detail。这样就完成了我们这个[移动CMS](http://cms.moqi.mobi)的几乎主要的功能了，有了上节想必对于我们来说要获取一个文章已经不是一件难的事情了。
 
-##获取每篇博客
+#### 获取每篇博客
 
 于是我们照猫画虎地写了一个``BlogDetail.js``
 
@@ -2345,11 +3444,9 @@ checkout到这个版本
     
 问题出现了，我们怎样才能进入最后的页面？
 
-##添加博文的路由
+#### 添加博文的路由
 
 在上一篇结束之后，每个博文都有对应的URL，即有对应的slug。而我们的博客的获取就是根据这个URL，获取的，换句话说，这些事情都是由API在做的。这里所要做的便是，获取博客的内容，再render。这其中又有一个问题是ajax执行的数据无法从外部取出，于是就有了上面的getBlog()调用render的方法。
-
-###Backbone路由参数
 
 我们需要传进一个参数，以便告诉BlogDetail需要获取哪一篇博文。
 
@@ -2407,7 +3504,7 @@ checkout到这个版本
 
 当前[墨颀CMS](http://cms.moqi.mobi/)的一些基础功能设计已经接近尾声了，在完成博客的前两部分之后，我们需要对此进行一个简单的重构。为的是提取出其中的获取Blog内容的逻辑，于是经过一番努力之后，终于有了点小成果。
 
-##墨颀CMS 重构
+### Step 7: 重构
 
 我们想要的结果，便是可以直接初始化及渲染，即如下的结果:
 
@@ -2438,7 +3535,7 @@ checkout到这个版本
 
 我们只需要将id、url、template传进去，便可以返回结果，再用getBlog部分传进参数。再渲染结果，这样我们就可以提取出两个不同View里面的相同的部分。
 
-##构建函数
+#### 构建函数
 
 于是，我们就需要构建一个函数RenderBlog，只需要将id,url,template等传进去就可以了。
 
@@ -2477,7 +3574,7 @@ checkout到这个版本
 
 正在我对这个[移动CMS](http://cms.moqi.mobi/)的功能一筹莫展的时候，帮小伙伴在做一个图片滑动的时候，便想着将这个功能加进去，很顺利地找到了一个库。
 
-##移动CMS滑动
+### Step 8: 移动CMS滑动
 
 我们所需要的两个功能很简单
 
@@ -2492,7 +3589,7 @@ checkout到这个版本
  
 然而，它并不会其他一些设备上工作。
 
-###添加jQuery Touchwipe
+**添加jQuery Touchwipe**
 
 添加到requirejs的配置中:
 
@@ -2579,31 +3676,46 @@ checkout到这个版本
  - 当用户向左滑动的时候，菜单应该关闭
  
 
-#Oculus  + Node.js  + Three.js 打造VR世界
+Oculus  + Node.js  + Three.js 打造VR世界
+===
 
-> Oculus Rift 是一款为电子游戏设计的头戴式显示器。这是一款虚拟现实设备。这款设备很可能改变未来人们游戏的方式。
+概况
+---
 
-周五Hackday Showcase的时候，突然有了点小灵感，便将闲置在公司的Oculus DK2借回家了——已经都是灰尘了~~。
+### 背景
 
 在尝试一个晚上的开发环境搭建后，我放弃了开发原生应用的想法。一是没有属于自己的电脑（如果Raspberry Pi II不算的话）——没有Windows、没有GNU/Linux，二是公司配的电脑是Mac OS。对于嵌入式开发和游戏开发来说，Mac OS简直是手机中的Windows Phone——坑爹的LLVM、GCC(Mac OS )、OpenGL、OGLPlus、C++11。并且官方对Mac OS和Linux的SDK的支持已经落后了好几个世纪。
 
-说到底，还是Web的开发环境到底还是比较容易搭建的。这个repo的最后效果图如下所示:
+说到底，还是Web的开发环境到底还是比较容易搭建的。
 
-![最后效果图](docs/demo.jpg)
+### Showcase
+
+这个repo的最后效果图如下所示:
+
+![最后效果图](./images/demo.jpg)
+
+![Three.js Oculus Effect](./images/oculus-vr.jpg)
 
 效果：
 
-1.  WASD控制前进、后退等等。
+1. WASD控制前进、后退等等。
 2. 旋转头部 =  真实的世界。
 3. 附加效果： 看久了头晕。
 
+### 框架： Oculus Rift & Node NMD
+
+> Oculus Rift 是一款为电子游戏设计的头戴式显示器。这是一款虚拟现实设备。这款设备很可能改变未来人们游戏的方式。
+
+步骤
+---
+
 现在，让我们开始构建吧。
 
-##Node Oculus Services
+### Step 1: Node Oculus Services
 
 这里，我们所要做的事情便是将传感器返回来的四元数(Quaternions)与欧拉角(Euler angles)以API的形式返回到前端。
 
-###安装Node NMD
+#### 安装Node NMD
 
 Node.js上有一个Oculus的插件名为node-hmd，hmd即面向头戴式显示器。它就是Oculus SDK的Node接口，虽说年代已经有些久远了，但是似乎是可以用的——官方针对 Mac OS和Linux的SDK也已经很久没有更新了。
 
@@ -2650,7 +3762,7 @@ node-hmd@0.2.1 node_modules/node-hmd
 
 不过，有最后一行就够了。
 
-###Node.js Oculus Hello，World
+### Step 2: Node.js Oculus Hello，World
 
 现在，我们就可以写一个Hello，World了，直接来官方的示例~~。
 
@@ -2703,7 +3815,7 @@ manager.getDeviceOrientation(function(err, deviceOrientation) {
 
 接着，我们就可以实时返回这些数据了。
 
-###Node Oculus WebSocket
+### Step 3: Node Oculus WebSocket
 
 在网上看到[http://laht.info/WebGL/DK2Demo.html](http://laht.info/WebGL/DK2Demo.html)这个虚拟现实的电影，并且发现了它有一个WebSocket，然而是Java写的，只能拿来当参考代码。
 
@@ -2802,17 +3914,11 @@ ws.send(data, function (error) {
 
 上面有一行注释是我之前一直遇到的一个坑，总之需要callback就是了。
 
-##Three.js + Oculus Effect  + DK2 Control
-
-在最后我们需要如下的画面：
-
-![Three.js Oculus Effect](docs/oculus-vr.jpg)
-
-当然，如果你已经安装了Web VR这一类的东西，你就不需要这样的效果了。如标题所说，你已经知道要用Oculus Effect，它是一个Three.js的插件。
+### Step 4: Oculus Effect  + DK2 Control
 
 在之前的版本中，Three.js都提供了Oculus的Demo，当然只能用来看。并且交互的接口是HTTP，感觉很难玩~~。
 
-##Three.js DK2Controls
+**Three.js DK2Controls**
 
 这时，我们就需要根据上面传过来的``四元数``(Quaternions)与欧拉角(Euler angles)来作相应的处理。
 
@@ -2832,7 +3938,7 @@ ws.send(data, function (error) {
 }
 ```
 
-###欧拉角与四元数
+**欧拉角与四元数**
 
 （ps: 如果没copy好，麻烦提出正确的说法，原谅我这个挂过高数的人。我只在高中的时候，看到这些资料。）
 
@@ -2876,10 +3982,10 @@ this.controller.setRotationFromMatrix(this.camera.matrix);
 
 这使我有足够的理由相信Oculus就是一个手机 + 一个6轴运动处理组件的升级板——因为，我玩过MPU6050这样的传感器，如图。。。
 
-![Oculus 6050](docs/mpu6050.jpg)
+![Oculus 6050](./images/mpu6050.jpg)
 
 
-###Three.js  DK2Controls
+**Three.js  DK2Controls**
 
 虽然下面的代码不是我写的，但是还是简单地说一下。
 
@@ -2994,7 +4100,7 @@ function render() {
 
 最后，添加相应的KeyHandler就好了~~。
 
-###Three.js KeyHandler
+### Step 5: Three.js KeyHandler
 
 KeyHandler对于习惯了Web开发的人来说就比较简单了:
 
@@ -3062,194 +4168,241 @@ if (this.camera.position.y < -10) {
 
 快接上你的HMD试试吧~~
 
-##结语
-
-如我在[《RePractise前端篇: 前端演进史》](https://github.com/phodal/repractise/blob/gh-pages/chapters/frontend.md)一文中所说的，这似乎就是新的"前端"。
+###练习建议
 
 
-最后效果可参见
+制作照片地图
+===
 
-[Phodal|cart db][1]
+概况
+---
 
-##EXIF##
+### Background:把照片放在地图上
+
+我使用的Nokia Lumia 920没有一个好的照片应用
+
+### Showcase
+
+![Phodal's Image](./images/onmap-demo.jpg)
+
+###框架： EXIF & ExifRead & CartoDB
+
+**EXIF**
 
 > 可交换图像文件常被简称为EXIF（Exchangeable image file format），是专门为数码相机的照片设定的，可以记录数码照片的属性信息和拍摄数据。
 
 EXIF信息以0xFFE1作为开头标记，后两个字节表示EXIF信息的长度。所以EXIF信息最大为64 kB，而内部采用TIFF格式。
 
-###ExifRead###
+**ExifRead**
 
 来自官方的简述
 
 > **Python library to extract EXIF data from tiff and jpeg files.**
 
-###ExifRead安装###
+**ExifRead安装**
 
-    pip install exifread
+```bash
+pip install exifread
+```
 
-###ExifRead Exif.py###
+**ExifRead Exif.py**
 
 官方写了一个exif.py的command可直接查看照片信息
 
-     EXIF.py images.jpg
+```bash
+EXIF.py images.jpg
+```
 
 
-##CartoDB##
+**CartoDB**
 
-###简介 ###
+> Create dynamic maps, analyze and build location aware and geospatial applications with your data using the power using the power of PostGIS in the cloud.
 
-Create dynamic maps, analyze and build location aware and geospatial applications with your data using the power using the power of PostGIS in the cloud.
+步骤
+---
+
+### Step 1: 解析读取照片信息
 
 简单的来说，就是我们可以创建包含位置信息的内容到上面去。
 
-![Phodal's Image][2]
+主要步骤如下：
 
-  [1]: http://phodal.cartodb.com/viz/80484668-b165-11e3-be2e-0e73339ffa50/public_map
-  [2]: /static/media/uploads/screen_shot_2014-03-22_at_10.05.39_am.jpg
-
-##打造自己的照片地图##
-主要步骤如下
-
- - 需要遍历自己的全部图片文件，
+ - 需要遍历自己的全部图片文件
  - 解析照片信息
  - 生成地理信息文件
- -  上传到cartodb
+ - 上传到cartodb
 
-###python 遍历文件###
+**python 遍历文件**
+
 代码如下，来自于《python cookbook》
 
-    import os, fnmatch
-    def all_files(root, patterns='*', single_level=False, yield_folders=False):
-        patterns = patterns.split(';')
-        for path, subdirs, files in os.walk(root):
-            if yield_folders:
-                files.extend(subdirs)
-            files.sort()
-            for name in files:
-                for pattern in patterns:
-                    if fnmatch.fnmatch(name, pattern):
-                        yield os.path.join(path, name)
-                        break
-                    if single_level:
-                        break
+```python
+import os, fnmatch
+def all_files(root, patterns='*', single_level=False, yield_folders=False):
+    patterns = patterns.split(';')
+    for path, subdirs, files in os.walk(root):
+        if yield_folders:
+            files.extend(subdirs)
+        files.sort()
+        for name in files:
+            for pattern in patterns:
+                if fnmatch.fnmatch(name, pattern):
+                    yield os.path.join(path, name)
+                    break
+                if single_level:
+                    break
+```
 
-###python 解析照片信息###
+**python 解析照片信息**
+
 由于直接从照片中提取的信息是
 
-    [34, 12, 51513/1000]
+```
+[34, 12, 51513/1000]
+```
 
 也就是
 
-    N 34� 13' 12.718
+```
+N 34� 13' 12.718
+```
 
 几度几分几秒的形式，我们需要转换为
 
-    34.2143091667
+```
+34.2143091667
+```
 
 具体的大致就是
 
-    def parse_gps(titude):
-        first_number = titude.split(',')[0]
-        second_number = titude.split(',')[1]
-        third_number = titude.split(',')[2]
-        third_number_parent = third_number.split('/')[0]
-        third_number_child = third_number.split('/')[1]
-        third_number_result = float(third_number_parent) / float(third_number_child)
-        return float(first_number) + float(second_number)/60 + third_number_result/3600
+```python    
+def parse_gps(titude):
+    first_number = titude.split(',')[0]
+    second_number = titude.split(',')[1]
+    third_number = titude.split(',')[2]
+    third_number_parent = third_number.split('/')[0]
+    third_number_child = third_number.split('/')[1]
+    third_number_result = float(third_number_parent) / float(third_number_child)
+    return float(first_number) + float(second_number)/60 + third_number_result/3600
+```
 
 也就是我们需要将second/60，还有minutes/3600。
 
-###python 提取照片信息生成文件###
+**python 提取照片信息生成文件**
 
-    import json
-    import exifread
-    import os, fnmatch
-    from exifread.tags import DEFAULT_STOP_TAG, FIELD_TYPES
-    from exifread import process_file, __version__
+```python
+import json
+import exifread
+import os, fnmatch
+from exifread.tags import DEFAULT_STOP_TAG, FIELD_TYPES
+from exifread import process_file, __version__
 
-    def all_files(root, patterns='*', single_level=False, yield_folders=False):
-        patterns = patterns.split(';')
-        for path, subdirs, files in os.walk(root):
-            if yield_folders:
-                files.extend(subdirs)
-            files.sort()
-            for name in files:
-                for pattern in patterns:
-                    if fnmatch.fnmatch(name, pattern):
-                        yield os.path.join(path, name)
-                        break
-                    if single_level:
-                        break
+def all_files(root, patterns='*', single_level=False, yield_folders=False):
+    patterns = patterns.split(';')
+    for path, subdirs, files in os.walk(root):
+        if yield_folders:
+            files.extend(subdirs)
+        files.sort()
+        for name in files:
+            for pattern in patterns:
+                if fnmatch.fnmatch(name, pattern):
+                    yield os.path.join(path, name)
+                    break
+                if single_level:
+                    break
 
-    def parse_gps(titude):
-        first_number = titude.split(',')[0]
-        second_number = titude.split(',')[1]
-        third_number = titude.split(',')[2]
-        third_number_parent = third_number.split('/')[0]
-        third_number_child = third_number.split('/')[1]
-        third_number_result = float(third_number_parent) / float(third_number_child)
-        return float(first_number) + float(second_number)/60 + third_number_result/3600
+def parse_gps(titude):
+    first_number = titude.split(',')[0]
+    second_number = titude.split(',')[1]
+    third_number = titude.split(',')[2]
+    third_number_parent = third_number.split('/')[0]
+    third_number_child = third_number.split('/')[1]
+    third_number_result = float(third_number_parent) / float(third_number_child)
+    return float(first_number) + float(second_number)/60 + third_number_result/3600
 
-    jsonFile = open("gps.geojson", "w")
-    jsonFile.writelines('{\n"type": "FeatureCollection","features": [\n')
+jsonFile = open("gps.geojson", "w")
+jsonFile.writelines('{\n"type": "FeatureCollection","features": [\n')
 
-    def write_data(paths):
-        index = 1
-        for path in all_files('./' + paths, '*.jpg'):
-            f = open(path[2:], 'rb')
-            tags = exifread.process_file(f)
-            # jsonFile.writelines('"type": "Feature","properties": {"cartodb_id":"'+str(index)+'"},"geometry": {"type": "Point","coordinates": [')
-            latitude = tags['GPS GPSLatitude'].printable[1:-1]
-            longitude = tags['GPS GPSLongitude'].printable[1:-1]
-            print latitude
-            print parse_gps(latitude)
-            # print tags['GPS GPSLongitudeRef']
-            # print tags['GPS GPSLatitudeRef']
-            jsonFile.writelines('{"type": "Feature","properties": {"cartodb_id":"' + str(index) + '"')
-            jsonFile.writelines(',"OS":"' + str(tags['Image Software']) + '","Model":"' + str(tags['Image Model']) + '","Picture":"'+str(path[7:])+'"')
-            jsonFile.writelines('},"geometry": {"type": "Point","coordinates": [' + str(parse_gps(longitude)) + ',' + str(
-                parse_gps(latitude)) + ']}},\n')
-            index += 1
+def write_data(paths):
+    index = 1
+    for path in all_files('./' + paths, '*.jpg'):
+        f = open(path[2:], 'rb')
+        tags = exifread.process_file(f)
+        # jsonFile.writelines('"type": "Feature","properties": {"cartodb_id":"'+str(index)+'"},"geometry": {"type": "Point","coordinates": [')
+        latitude = tags['GPS GPSLatitude'].printable[1:-1]
+        longitude = tags['GPS GPSLongitude'].printable[1:-1]
+        print latitude
+        print parse_gps(latitude)
+        # print tags['GPS GPSLongitudeRef']
+        # print tags['GPS GPSLatitudeRef']
+        jsonFile.writelines('{"type": "Feature","properties": {"cartodb_id":"' + str(index) + '"')
+        jsonFile.writelines(',"OS":"' + str(tags['Image Software']) + '","Model":"' + str(tags['Image Model']) + '","Picture":"'+str(path[7:])+'"')
+        jsonFile.writelines('},"geometry": {"type": "Point","coordinates": [' + str(parse_gps(longitude)) + ',' + str(
+            parse_gps(latitude)) + ']}},\n')
+        index += 1
 
-    write_data('imgs')
+write_data('imgs')
 
-    jsonFile.writelines(']}\n')
-    jsonFile.close()
+jsonFile.writelines(']}\n')
+jsonFile.close()
+```
 
-最终代码可见[python cartodb][3]
-[3]:https://github.com/gmszone/py_cartodb.git
+### Step 2: 上传数据
 
-###上传到cartodb###
+注册CartoDB，然后上传数据。
 
-###从零开始设计技能树: 使用Graphviz建立模型
+### 练习建议
+
+无
+
+
+
+D3.js 制作技能树
+===========
+
+概况
+---
+
+### 背景
 
 在开始设计新的技能树——[Sherlock](https://github.com/phodal/sherlock)的同时，结合一下原有的技能树，说说如何去设计，新的技能树还很丑。
 
-![Sherlock][1]
+### Showcase 
 
-##Graphviz
+代码见： [https://github.com/phodal/sherlock](https://github.com/phodal/sherlock)
+
+![Sherlock](./images/sherlock.png)
+
+###Graphviz
 
 >  Graphviz （英文：Graph Visualization Software的缩写）是一个由AT&T实验室启动的开源工具包，用于绘制DOT语言脚本描述的图形。它也提供了供其它软件使用的库。Graphviz是一个自由软件，其授权为Eclipse Public License。其Mac版本曾经获得2004年的苹果设计奖。
 
 一个简单的示例代码如下:
 
-	graph example1 {
-	    Server1 -- Server2
-	    Server2 -- Server3
-	    Server3 -- Server1
-	}
+```dot
+graph example1 {
+    Server1 -- Server2
+    Server2 -- Server3
+    Server3 -- Server1
+}
+```
 
 执行编译后:
 
-    dot -Tjpg lz.dot -o lz.jpg
+```bash
+dot -Tjpg lz.dot -o lz.jpg
+```
 
 就会生成下面的图片
 
-![lz][2]
+![lz](./images/lz.jpg)
 	
 接着我们便可以建立一个简单的模型来构建我们的技能树。
 
-##简单的技能树
+步骤
+---
+
+### Step 1: 打造简单的技能树
 
 先以JavaScript全栈作一个简单的示例，他们可能存在下面的依赖关系:
 
@@ -3267,282 +4420,281 @@ Create dynamic maps, analyze and build location aware and geospatial application
 
 于是我们有了这张图:
 
-![Tree][3]
+![Tree](./images/tree.jpg)
 
 而我们的代码是这样的:
 
-```c
-    digraph tree
-    {
-        nodesep=0.5;
-        charset="UTF-8";
-        rankdir=LR;
-        fixedsize=true;
-        node [style="rounded,filled", width=0, height=0, shape=box, fillcolor="#E5E5E5", concentrate=true]
-        "JavaScript" ->"Web前端"
-        "HTML" -> "Web前端"
-        "CSS" -> "Web前端"
-        "Web前端" -> "Web开发"
-        "JavaScript" -> "Node.js" -> "Web服务端"
-        "SQL/NoSQL" -> "Web服务端"
-        "Web服务端" -> "Web开发"
-    }
+```dot
+digraph tree
+{
+    nodesep=0.5;
+    charset="UTF-8";
+    rankdir=LR;
+    fixedsize=true;
+    node [style="rounded,filled", width=0, height=0, shape=box, fillcolor="#E5E5E5", concentrate=true]
+    "JavaScript" ->"Web前端"
+    "HTML" -> "Web前端"
+    "CSS" -> "Web前端"
+    "Web前端" -> "Web开发"
+    "JavaScript" -> "Node.js" -> "Web服务端"
+    "SQL/NoSQL" -> "Web服务端"
+    "Web服务端" -> "Web开发"
+}
 ```
     
 上面举出的是一个简单的例子，对应的我们可以做一些更有意思的东西，比如将dot放到Web上，详情见下一篇。
 
-
-  [1]: /static/media/uploads/sherlock.png
-  [2]: /static/media/uploads/lz.jpg
-  [3]: /static/media/uploads/tree.jpg
-
-#技能树之旅: 计算点数与从这开始
-
-之前写了一篇[技能树之旅: 从模块分离到测试](http://www.phodal.com/blog/rebuild-skilltree-from-module-split-to-test/)，现在来说说这其中发生了什么。
-
-##从这开始
-
-在我们没有点击任何技能的时候，显示的是"从这开始"，而当我们点下去时发生了什么?
-
-![Start](http://www.phodal.com//static/media/uploads/start.jpg)
-
-明显变化如下:
-
- - 样式变了
- - URL变成了[http://skill.phodal.com/#_a2_1_Name](http://skill.phodal.com/#_a2_1_Name)
- - 点数 + 1
- - 点亮了箭头
- 
-###从Knockout开始
-
-> Knockout是一个轻量级的UI类库，通过应用MVVM模式使JavaScript前端UI简单化。
-
-据说有下面的一些特性。
-
- - 声明式绑定 (Declarative Bindings)：使用简明易读的语法很容易地将模型(model)数据关联到DOM元素上。
- - UI界面自动刷新 (Automatic UI Refresh)：当您的模型状态(model state)改变时，您的UI界面将自动更新。
- - 依赖跟踪 (Dependency Tracking)：为转变和联合数据，在你的模型数据之间隐式建立关系。
- - 模板 (Templating)：为您的模型数据快速编写复杂的可嵌套的UI。
- 
-在我们的html中的从这开始是这样一段HTML
-
-    <h2 class="start-helper" data-bind="css:{active:noPointsSpent}">从这开始!</h2> 
-
-这是对应的CSS:
-
-    .start-helper-avatar {
-      background: url(../images/red-arrow.png) no-repeat left center;
-      padding-left: 55px;
-      top: 80px;
-      position: relative;
-      left: 410px;
-      -moz-opacity: 0;
-      -khtml-opacity: 0;
-      -webkit-opacity: 0;
-      opacity: 0;
-      -ms-filter: progid:DXImageTransform.Microsoft.Alpha(opacity=0);
-      filter: alpha(opacity=0);
-    }
-    
-    .start-helper-avatar.active {
-      -moz-opacity: 1;
-      -khtml-opacity: 1;
-      -webkit-opacity: 1;
-      opacity: 1;
-      -ms-filter: progid:DXImageTransform.Microsoft.Alpha(opacity=100);
-      filter: alpha(opacity=100);
-    }
-
-``.start-helper-avatar.active``与``.start-helper-avatar``的不同之处在于.actie将opacity设置为了1。
-
-而，我们对应的JS代码是这样子的:
-
-    self.noPointsSpent = ko.computed(function () {
-      return !Boolean(ko.utils.arrayFirst(self.skills(), function (skill) {
-        return (skill.points() > 0);
-      }));
-    });
-    
-当有一个技能点数大于0时，返回False。而当没有技能点数时，html是这样的。    
-
-    <h2 class="start-helper active" data-bind="css:{active:noPointsSpent}">从这开始!</h2>
-    
-故而对于此，我们可以明白，Knockout的CSS绑定是这样子的:
-
-> CSS绑定主要是给DOM元素对象添加或移除一个或多个css class类名。这非常有用，比如当值变成负数的时候用红色高亮显示。
-
-##点数计算
-
-对应的我们可以找到点数计算的HTML
-
-    <div data-bind="css: { 'can-add-points': canAddPoints, 'has-points': hasPoints, 'has-max-points': hasMaxPoints }, attr: { 'data-skill-id': id }" class="skill">
-    
-当然还有:
-    
-    <div data-bind="click: addPoint, rightClick: removePoint" class="hit-area"></div>
-    
-
-与CSS:
-
-    .skill.can-add-points .frame {
-      background-position: -80px top;
-    }
-    .skill.can-add-points .skill-dependency {
-      -moz-opacity: 1;
-      -khtml-opacity: 1;
-      -webkit-opacity: 1;
-      opacity: 1;
-      -ms-filter: progid:DXImageTransform.Microsoft.Alpha(opacity=100);
-      filter: alpha(opacity=100);
-    }
-
-对应的，我们可以找到它的js函数:
-
-      self.addPoint = function () {
-        if (self.canAddPoints()) {
-          self.points(self.points() + 1);
-        }
-      };
-      self.removePoint = function () {
-        if (self.canRemovePoints()) {
-          self.points(self.points() - 1);
-        }
-      };
-      
-看上去通俗易懂，唯一需要理解的就是``click``。
-
-> click绑定在DOM元素上添加事件句柄以便元素被点击的时候执行定义的JavaScript 函数。
-
-##其他
-
-Sherlock:一个新的技能树:[https://github.com/phodal/sherlock](https://github.com/phodal/sherlock)。
-
-开发进行时，欢迎加入。
-
-  [1]: /static/media/uploads/start.jpg  
+### Step 3: D3.js Tooltipster
   
 使用D3.js与Darge-d3构建一个简单的技能树的时候，需要一个简单的类似于小贴士的插件。
 
-![Tooltips][1]
+![Tooltips](./images/tips.jpg)
 
-##Tooltipster
+#### Tooltipster
 
 Tooltipster是一个jQuery tooltip 插件，兼容Mozilla Firefox, Google Chrome, IE8+。
 
 简单示例``html``:
 
-        <section class="container tooltip" title="Parent container">
-		<a href="http://google.com" class="tooltip" title="Get your Google on">Google</a>
-	</section>
+```html
+<section class="container tooltip" title="Parent container">
+	<a href="http://google.com" class="tooltip" title="Get your Google on">Google</a>
+</section>
+```
 
 简单示例``js`:
 
-		$(document).ready(function() {
-			$('.tooltip').tooltipster();
-		});
-
-###D3.js Tooltipster Require配置
+```javascript
+$(document).ready(function() {
+	$('.tooltip').tooltipster();
+});
+```
 
 D3.js、Tooltipster与Requirejs的配置如下所示:
 
-	require.config({
-	  baseUrl: 'app',
-	  paths: {
-	    jquery: 'lib/jquery-2.1.3',
-	    d3: 'lib/d3.min',
-	    text: 'lib/text',
-	    'jquery.tooltipster': 'lib/jquery.tooltipster.min'
-	  },
-	  'shim': {
-	    'jquery.tooltipster': {
-	      deps: ['jquery']
-	    }
-	  }
-	});
+```javascript
+require.config({
+  baseUrl: 'app',
+  paths: {
+    jquery: 'lib/jquery-2.1.3',
+    d3: 'lib/d3.min',
+    text: 'lib/text',
+    'jquery.tooltipster': 'lib/jquery.tooltipster.min'
+  },
+  'shim': {
+    'jquery.tooltipster': {
+      deps: ['jquery']
+    }
+  }
+});
+```
 
-###整合代码
+#### 整合代码
 
 最后代码如下所示:
 
-      inner.selectAll('g.node')
-        .each(function (v, id) {
+```javascript
+inner.selectAll('g.node')
+  .each(function (v, id) {
+    g.node(v).books = Utils.handleEmptyDocs(g.node(v).books);
+    g.node(v).links = Utils.handleEmptyDocs(g.node(v).links);
+
+    var data = {
+      id: id,
+      name: v,
+      description: g.node(v).description,
+      books: g.node(v).books,
+      links: g.node(v).links
+    };
+    var results = lettuce.Template.tmpl(description_template, data);
+
+    $(this).tooltipster({
+      content: $(results),
+      contentAsHTML: true,
+      position: 'left',
+      animation: 'grow',
+      interactive: true});
+    $(this).find('rect').css('fill', '#ecf0f1');
+  });
+```
 
 
-          g.node(v).books = Utils.handleEmptyDocs(g.node(v).books);
-          g.node(v).links = Utils.handleEmptyDocs(g.node(v).links);
+技术雷达趋势
+===
 
-          var data = {
-            id: id,
-            name: v,
-            description: g.node(v).description,
-            books: g.node(v).books,
-            links: g.node(v).links
-          };
-          var results = lettuce.Template.tmpl(description_template, data);
+概况
+---
 
-          $(this).tooltipster({
-            content: $(results),
-            contentAsHTML: true,
-            position: 'left',
-            animation: 'grow',
-            interactive: true});
-          $(this).find('rect').css('fill', '#ecf0f1');
-        });
+###背景
 
-##结束
+出于一些原因，我需要构建一个项目组相关的技术趋势图。首先也是想到了[ThoughtWorks 技术雷达](https://www.thoughtworks.com/cn/radar)，然而我也发现了技术雷达只会发现一些新出现的技术，以及其对应的一些趋势。对于现有的技术栈的一些趋势不够明显，接着就只能去构建一个新的技术趋势图。
 
-代码见： [https://github.com/phodal/sherlock](https://github.com/phodal/sherlock)
+当然首选的框架也是D3.js，似乎会一些更好的工具，但是并不没有去尝试。
 
-  [1]: /static/media/uploads/tips.jpg  
+
+### Showcase
+
+在线预览： [http://phodal.github.io/techstack](http://phodal.github.io/techstack)
+
+最后的效果如下图:
+
+![Screenshot](./images/tech-stack.jpg)
+
+### D3.js
+
+步骤
+---
+
+### Step 1: Schema与原始代码
+
+最开始的代码是基于[https://github.com/simonellistonball/techradar](https://github.com/simonellistonball/techradar)这个库的，但是这其中的数据都是写好的。而在找到这个库之前，我也定义好了我的数据应该有的样子：
+
+```javascript
+{
+  "name": "Java",
+  "important": 5,
+  "usage": 5,
+  "current": 4,
+  "future": 3,
+  "description": "--------"
+}
+```    
+
+对就于每个技术栈都会有名字、重要程度、使用程度、当前级别、未来级别、描述的字段。毕竟技术是有其应该有的趋势的，如果仅仅只是在上面用一些图形来表示可能又不够。
+
+接着，又按照不同的维度区分为language、others、tools、frameworks四个维度
+
+```javascript
+{
+  "language": [
+    {
+      "name": "Java",
+      "important": 5,
+      "usage": 5,
+      "current": 4,
+      "future": 3,
+      "description": "--------"
+    }
+  ],
+  "tools": [
+    {
+      "name": "Linux",
+      "important": 3,
+      "usage": 3,
+      "current": 3,
+      "future": 2,
+      "description": "--------"
+    }
+  ],
+  "others": [
+    {
+      "name": "Agile",
+      "important": 3,
+      "usage": 5,
+      "current": 3,
+      "future": 3,
+      "description": "--------"
+    }
+  ],
+  "frameworks": [
+    {
+      "name": "Node.js",
+      "important": 3,
+      "usage": 5,
+      "current": 3,
+      "future": 5,
+      "description": "--------"
+    }
+  ]
+}
+```
+
+而在上述的版本中，则有了我想要的箭头，尽管数据不合适，但是还是可以改的。
+
+### Step 2: 处理数据 
+
+然后，我们的主要精力就是在parse上面的数据中，取出每个数据，按照不同的维度去放置技术栈，并进行一些转换。
+
+```javascript
+var results = [];
+for (var quadrant in data) {
+  $.each(data[quadrant], function (index, skill) {
+    results.push({
+      name: skill.name,
+      important: skill.important,
+      usage: skill.usage,
+      description: skill.description,
+      trend: entry(quadrant, convertFractions(skill.current), convertFractions(skill.future))
+    });
+  })
+}
+```
+
+
+文本转化为Logo
+===
+
+概况
+---
+
+### 背景
 
 在设计技能树的时候需要做一些简单的Logo，方便我们来识别，这时候就想到了PIL。加上一些简单的圆角，以及特殊的字体，就可以构成一个简单的Logo。做成的图标看上去还不错:
 
-![Node][1] ![Refactor][2] ![TDD][3] ![Clean Code][4]
+### ShowCase
 
-##需求说明
+![Node](./images/node.png) ![Refactor](./images/refactor.png) ![TDD](./images/tdd.png) ![Clean Code](./images/clean_code.png)
+
+代码见:[https://github.com/phodal/text2logo](https://github.com/phodal/text2logo)
+  
+### 需求说明
 
 简单的说一些我们的附加需求
 
  - 圆角
  - 色彩(自动) 
 
-##Python 文字转Logo实战
+步骤
+---
 
-###基础代码
+###Step 1: Python 文字转Logo实战
 
 一个简单的PIL生成图片的代码:
 
-	# -*- coding: utf-8 -*-
-	from PIL import Image, ImageDraw, ImageFont
+```python
+# -*- coding: utf-8 -*-
+from PIL import Image, ImageDraw, ImageFont
 
-	img = Image.new('L', (128, 128), 255)
-	draw = ImageDraw.Draw(img)
-	text_to_draw = unicode('xxs', 'utf-8')
-	font = ImageFont.truetype('fonts/NotoSansCJKsc-Regular.otf', 12)
-	draw.text((2, 2), text_to_draw, font=font)
-	del draw
+img = Image.new('L', (128, 128), 255)
+draw = ImageDraw.Draw(img)
+text_to_draw = unicode('xxs', 'utf-8')
+font = ImageFont.truetype('fonts/NotoSansCJKsc-Regular.otf', 12)
+draw.text((2, 2), text_to_draw, font=font)
+del draw
 
-	img.save('build/image.png')
+img.save('build/image.png')
+```
 
-###圆角代码
+#### 圆角代码
 
 我们需要的是在上面的代码上加上一个圆角的功能，于是Google到了这个函数
 
+```javascript
+def add_corners(im, rad):
+    circle = Image.new('L', (rad * 2, rad * 2), 0)
+    image = ImageDraw.Draw(circle)
+    image.ellipse((0, 0, rad * 2, rad * 2), fill=255)
+    alpha = Image.new('L', im.size, 255)
+    w, h = im.size
+    alpha.paste(circle.crop((0, 0, rad, rad)), (0, 0))
+    alpha.paste(circle.crop((0, rad, rad, rad * 2)), (0, h - rad))
+    alpha.paste(circle.crop((rad, 0, rad * 2, rad)), (w - rad, 0))
+    alpha.paste(circle.crop((rad, rad, rad * 2, rad * 2)), (w - rad, h - rad))
+    im.putalpha(alpha)
+    return im
+```
 
-	def add_corners(im, rad):
-	    circle = Image.new('L', (rad * 2, rad * 2), 0)
-	    image = ImageDraw.Draw(circle)
-	    image.ellipse((0, 0, rad * 2, rad * 2), fill=255)
-	    alpha = Image.new('L', im.size, 255)
-	    w, h = im.size
-	    alpha.paste(circle.crop((0, 0, rad, rad)), (0, 0))
-	    alpha.paste(circle.crop((0, rad, rad, rad * 2)), (0, h - rad))
-	    alpha.paste(circle.crop((rad, 0, rad * 2, rad)), (w - rad, 0))
-	    alpha.paste(circle.crop((rad, rad, rad * 2, rad * 2)), (w - rad, h - rad))
-	    im.putalpha(alpha)
-	    return im
-
-###颜色配置
+#### 颜色配置
 
 在Github上找到了一个配色还不错的CSS，将之改为color.Ini，在里面配置了不同色彩与文字、前景的有关系等等，如:
 
@@ -3556,39 +4708,45 @@ D3.js、Tooltipster与Requirejs的配置如下所示:
 
 读取配置则用的是``ConfigParser``:
 
-	import ConfigParser
+```python
+import ConfigParser
 
-	ConfigColor = ConfigParser.ConfigParser()
-	ConfigColor.read("./color.ini")
+ConfigColor = ConfigParser.ConfigParser()
+ConfigColor.read("./color.ini")
 
-	bg_colors = []
-	font_colors = []
+bg_colors = []
+font_colors = []
 
-	for color_name, color in ConfigColor.items('Color'):
-	    bg_colors.append(color.replace('#', '').split(',')[0])
-	    font_colors.append(color.replace('#', '').split(',')[1])
+for color_name, color in ConfigColor.items('Color'):
+    bg_colors.append(color.replace('#', '').split(',')[0])
+    font_colors.append(color.replace('#', '').split(',')[1])
 
-	colors_length = ConfigColor.items('Color').__len__()
+colors_length = ConfigColor.items('Color').__len__()
+```
 
 最后我们就可以得到我们想要的图片了~~
 
-##结束
+GEOJSON与ElasticSearch实现高级图形搜索
+===
 
-代码见:[https://github.com/phodal/text2logo](https://github.com/phodal/text2logo)
+概况
+---
 
-  [1]: /static/media/uploads/node.png
-  [2]: /static/media/uploads/refactor.png
-  [3]: /static/media/uploads/tdd.png
-  [4]: /static/media/uploads/clean_code.png
-  
+### 背景
+
+### Showcase
+
+在线Demo见： [http://vmap.phodal.com/](http://vmap.phodal.com/)
 
 或者你已经使用过了相应多的省市区与地图联动，但是这些联动往往是单向的、不可逆。并且这些数据往往都是在线使用的，不能离线使用。下图是一个结合百度地图的省市区与地图联动：
 
-![一般的省市区与地图联动](/static/media/uploads/general-province-city-map.png)
+![一般的省市区与地图联动](./images/general-province-city-map.png)
 
 我们可以在这个应用里选择，相应的省市区然后地图会跳转到相应的地图。当我们在地图上漫游的时候，如果没有显示当前的省市区是不是变得很难使用。于是，我们就来创建一个吧：
 
-![地图到省市区联动](/static/media/uploads/anti-map-action.jpg)
+![地图到省市区联动](./images/anti-map-action.jpg)
+
+### jQuery + Mustache + Leaflet
 
 相关技术栈：
 
@@ -3598,8 +4756,10 @@ D3.js、Tooltipster与Requirejs的配置如下所示:
  - Mustache，模板生成。
  - Leaflet，交互地图库。
 
-离线地图与搜索
+步骤
 ---
+
+### Step 1: 离线地图与搜索
 
 在GitHub上搜索数据的过程中，发现了一个名为[d3js-geojson](https://github.com/ufoe/d3js-geojson)的项目里面放着中国详细省、市、县数据，并且还有及GeoJSON文件。
 
@@ -3608,15 +4768,13 @@ D3.js、Tooltipster与Requirejs的配置如下所示:
  - 地图离线
  - 多边形搜索
 
-###地图离线 
-
 首先，我们要知道GeoJSON是怎样的一个存在。
 
 > GeoJSON是一种对各种地理数据结构进行编码的格式，基于Javascript对象表示法的地理空间信息数据交换格式。GeoJSON对象可以表示几何、特征或者特征集合。GeoJSON支持下面几何类型：点、线、面、多点、多线、多面和几何集合。GeoJSON里的特征包含一个几何对象和其他属性，特征集合表示一系列特征。
 
 换句话来说，根据这个文件里面的多边形，我们可以绘制出中国地图。由于上面的点是真实的地理位置信息，所以无论我们怎样的缩放这些点的位置都不会发生变化。如下图是GitHub对这个数据文件的解析：
 
-![中国GeoJSON文件](/static/media/uploads/china-geojson.jpg)
+![中国GeoJSON文件](./images/china-geojson.jpg)
 
 （PS: 预览可以打开这个页面：[Vmap GeoJSON](https://github.com/phodal/vmap/blob/gh-pages/static/data/china.json)
 
@@ -3624,11 +4782,11 @@ D3.js、Tooltipster与Requirejs的配置如下所示:
 
 接着问题来了，我们并没有把每个用户的数据存入到数据库中，那么我们怎么才能实现搜索？
 
-###多边形搜索
+#### 多边形搜索
 
 所谓的多边形搜索就是画一个圈圈（任意多边形），然后你就可以去约这个圈圈里的人，如下图所示：
 
-![多边形搜索](/static/media/uploads/geopoly2d-small.png)
+![多边形搜索](./images/geopoly2d-small.png)
 
 而圈圈搜索依赖于圈圈上的连续的点构建的形状来进行搜索，上面的每个点都包含了相应的经纬度。因此，只要是在这个圈圈里的用户都是可以搜索得到的。
 
@@ -3640,14 +4798,13 @@ D3.js、Tooltipster与Requirejs的配置如下所示:
 详细信息可以见: [VMap Bot](https://github.com/phodal/vmap-bot)
 
 
-从地点到地图上显示
----
+### Step 2: 从地点到地图上显示
 
 拿Bootstrap实现一个Dropdown是一件很容易的事，我们只要动用一下相应的模板就好了。难就难在，如果去与地图交互。
 
 最初的时候要用Event的形式来实现，但是发现这样似乎会让其紧耦合。就改用了监听Hash Change的形式来实现，在总的地图上每一个省都有一个对应的ID，这个ID会对应相应的省的数据。如下图所示：
 
-![Province Hash](/static/media/uploads/province-hash-with-map.jpg)
+![Province Hash](./images/province-hash-with-map.jpg)
 
 接着，我们就需要从这个Hash中判断它的级别和ID，随后转由相应的函数来处理这些逻辑即可。随后，我们要做两件事：
 
@@ -3658,7 +4815,7 @@ D3.js、Tooltipster与Requirejs的配置如下所示:
 
 从地图上跳转到对应的省的时候：
 
- 1. 用Aajx请求获取这个省的GeoJSON文件
+ 1. 用Ajax请求获取这个省的GeoJSON文件
  2. 获取这个市的中心位置，并对其进行缩放
  3. 将上面的每个市绘制到地图上
 
@@ -3666,18 +4823,13 @@ D3.js、Tooltipster与Requirejs的配置如下所示:
 
 同理，我们也可以对上面的市运行处理。但是因为这些市并不存在GEO信息，所以我只是从其多连形信息取了一个点，再将这个点放到data-geo中：
 
-![Data GEO](/static/media/uploads/city-with-geo.jpg)
+![Data GEO](./images/city-with-geo.jpg)
 
 对应于省市的，对于区的处理也是如此。这样，我们就完成了地点到地图的显示了。
 
-从地图到地点上显示
----
+###Step 3: 从地图到地点上显示
 
 从地图上到地点就比较简单了，点击时修改对应的text即可。
 
-![VMap Click ](/static/media/uploads/vmap-click-handler.jpg)
+![VMap Click ](./images/vmap-click-handler.jpg)
 
-Demo
----
-
-在线Demo见： [http://vmap.phodal.com/](http://vmap.phodal.com/)
